@@ -53,13 +53,6 @@ static std::vector<ChatMessage> ParseChatMessages(const nlohmann::json& j, bool*
   return out;
 }
 
-static std::vector<OllamaChatRequest::Message> ToOllamaMessages(const std::vector<ChatMessage>& msgs) {
-  std::vector<OllamaChatRequest::Message> out;
-  out.reserve(msgs.size());
-  for (const auto& m : msgs) out.push_back({m.role, m.content});
-  return out;
-}
-
 static std::vector<std::string> ParseRequestedToolNames(const nlohmann::json& j) {
   std::vector<std::string> out;
   if (!j.contains("tools") || !j["tools"].is_array()) return out;
@@ -140,7 +133,7 @@ static std::optional<std::string> ExtractFinalFromAssistantJson(const std::strin
   return std::nullopt;
 }
 
-static std::string FakeModelOnce(const std::vector<OllamaChatRequest::Message>& messages) {
+static std::string FakeModelOnce(const std::vector<ChatMessage>& messages) {
   bool has_tool_result = false;
   std::string last_user;
   std::string last_system;
@@ -327,24 +320,24 @@ static bool ValidateSchemaLoose(const nlohmann::json& schema, const nlohmann::js
 }
 
 static std::string ChatOnceText(const std::string& model,
-                                const std::vector<OllamaChatRequest::Message>& messages,
-                                OllamaProvider* ollama,
+                                const std::vector<ChatMessage>& messages,
+                                IProvider* provider,
                                 std::string* err) {
   if (model == "fake-tool") return FakeModelOnce(messages);
-  OllamaChatRequest oreq;
-  oreq.model = model;
-  oreq.stream = false;
-  oreq.messages = messages;
-  auto oresp = ollama->ChatOnce(oreq, err);
-  if (!oresp) return {};
-  return oresp->content;
+  ChatRequest req;
+  req.model = model;
+  req.stream = false;
+  req.messages = messages;
+  auto resp = provider->ChatOnce(req, err);
+  if (!resp) return {};
+  return resp->content;
 }
 
 static ToolLoopResult RunPlanner(const std::string& model,
                                  const std::vector<ChatMessage>& full_messages,
                                  const std::vector<ToolSchema>& allowed_tools,
                                  const ToolRegistry& registry,
-                                 OllamaProvider* ollama,
+                                 IProvider* provider,
                                  int max_plan_steps,
                                  int max_plan_rewrites,
                                  int max_tool_calls,
@@ -359,16 +352,16 @@ static ToolLoopResult RunPlanner(const std::string& model,
   std::unordered_set<std::string> allowed_names;
   for (const auto& t : allowed_tools) allowed_names.insert(t.name);
 
-  std::vector<OllamaChatRequest::Message> plan_msgs;
+  std::vector<ChatMessage> plan_msgs;
   plan_msgs.reserve(full_messages.size() + 2);
   plan_msgs.push_back({"system", BuildPlannerSystemPrompt(allowed_tools, max_plan_steps)});
-  for (const auto& m : full_messages) plan_msgs.push_back({m.role, m.content});
+  for (const auto& m : full_messages) plan_msgs.push_back(m);
 
   std::optional<std::vector<PlannerPlanStep>> plan;
   std::string plan_text;
   int rewrites = 0;
   for (int attempt = 0; attempt <= max_plan_rewrites; attempt++) {
-    plan_text = ChatOnceText(model, plan_msgs, ollama, err);
+    plan_text = ChatOnceText(model, plan_msgs, provider, err);
     if (plan_text.empty() && err && !err->empty()) {
       out.planner_failed = true;
       return out;
@@ -436,9 +429,9 @@ static ToolLoopResult RunPlanner(const std::string& model,
   out.plan = nlohmann::json::array();
   for (const auto& s : *plan) out.plan.push_back({{"name", s.name}, {"arguments", s.arguments}});
 
-  std::vector<OllamaChatRequest::Message> exec_msgs;
+  std::vector<ChatMessage> exec_msgs;
   exec_msgs.reserve(full_messages.size() + out.plan_steps + 4);
-  for (const auto& m : full_messages) exec_msgs.push_back({m.role, m.content});
+  for (const auto& m : full_messages) exec_msgs.push_back(m);
 
   int tool_calls_used = 0;
   for (size_t i = 0; i < plan->size(); i++) {
@@ -486,12 +479,12 @@ static ToolLoopResult RunPlanner(const std::string& model,
     tool_calls_used++;
   }
 
-  std::vector<OllamaChatRequest::Message> final_msgs;
+  std::vector<ChatMessage> final_msgs;
   final_msgs.reserve(exec_msgs.size() + 2);
   final_msgs.push_back({"system", BuildPlannerFinalSystemPrompt()});
   for (const auto& m : exec_msgs) final_msgs.push_back(m);
 
-  auto final_text = ChatOnceText(model, final_msgs, ollama, err);
+  auto final_text = ChatOnceText(model, final_msgs, provider, err);
   out.steps = 2;
   if (auto final = ExtractFinalFromAssistantJson(final_text)) {
     out.final_text = *final;
@@ -505,12 +498,12 @@ static ToolLoopResult RunToolLoop(const std::string& model,
                                   const std::vector<ChatMessage>& full_messages,
                                   const std::vector<ToolSchema>& allowed_tools,
                                   const ToolRegistry& registry,
-                                  OllamaProvider* ollama,
+                                  IProvider* provider,
                                   int max_steps,
                                   int max_tool_calls,
                                   std::string* err) {
   ToolLoopResult out;
-  std::vector<OllamaChatRequest::Message> msgs;
+  std::vector<ChatMessage> msgs;
   msgs.reserve(full_messages.size() + 8);
 
   std::unordered_set<std::string> allowed_names;
@@ -519,7 +512,7 @@ static ToolLoopResult RunToolLoop(const std::string& model,
   if (!allowed_tools.empty()) {
     msgs.push_back({"system", BuildToolSystemPrompt(allowed_tools)});
   }
-  for (const auto& m : full_messages) msgs.push_back({m.role, m.content});
+  for (const auto& m : full_messages) msgs.push_back(m);
 
   if (max_steps <= 0) max_steps = 1;
   if (max_tool_calls < 0) max_tool_calls = 0;
@@ -531,13 +524,13 @@ static ToolLoopResult RunToolLoop(const std::string& model,
     if (model == "fake-tool") {
       assistant_text = FakeModelOnce(msgs);
     } else {
-      OllamaChatRequest oreq;
-      oreq.model = model;
-      oreq.stream = false;
-      oreq.messages = msgs;
-      auto oresp = ollama->ChatOnce(oreq, err);
-      if (!oresp) return out;
-      assistant_text = oresp->content;
+      ChatRequest req;
+      req.model = model;
+      req.stream = false;
+      req.messages = msgs;
+      auto resp = provider->ChatOnce(req, err);
+      if (!resp) return out;
+      assistant_text = resp->content;
     }
 
     if (auto calls = ParseToolCallsFromAssistantText(assistant_text)) {
@@ -611,8 +604,8 @@ static ToolLoopResult RunToolLoop(const std::string& model,
 
 }  // namespace
 
-OpenAiRouter::OpenAiRouter(SessionManager* sessions, OllamaProvider* ollama, ToolRegistry tools)
-    : sessions_(sessions), ollama_(ollama), tools_(std::move(tools)) {}
+OpenAiRouter::OpenAiRouter(SessionManager* sessions, ProviderRegistry* providers, ToolRegistry tools)
+    : sessions_(sessions), providers_(providers), tools_(std::move(tools)) {}
 
 ToolRegistry* OpenAiRouter::MutableTools() {
   return &tools_;
@@ -620,18 +613,27 @@ ToolRegistry* OpenAiRouter::MutableTools() {
 
 void OpenAiRouter::Register(httplib::Server* server) {
   server->Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
-    std::string err;
-    auto models = ollama_->ListModels(&err);
     nlohmann::json out;
     out["object"] = "list";
     out["data"] = nlohmann::json::array();
-    for (const auto& m : models) {
-      nlohmann::json item;
-      item["id"] = m.id;
-      item["object"] = "model";
-      item["created"] = NowSeconds();
-      item["owned_by"] = m.owned_by;
-      out["data"].push_back(std::move(item));
+    const std::string default_provider = providers_ ? providers_->DefaultProviderName() : "";
+    if (providers_) {
+      for (auto* p : providers_->List()) {
+        std::string err;
+        auto models = p->ListModels(&err);
+        for (const auto& m : models) {
+          nlohmann::json item;
+          if (p->Name() == default_provider) {
+            item["id"] = m.id;
+          } else {
+            item["id"] = p->Name() + ":" + m.id;
+          }
+          item["object"] = "model";
+          item["created"] = NowSeconds();
+          item["owned_by"] = m.owned_by.empty() ? p->Name() : m.owned_by;
+          out["data"].push_back(std::move(item));
+        }
+      }
     }
     SendJson(&res, 200, out);
   });
@@ -654,7 +656,9 @@ void OpenAiRouter::Register(httplib::Server* server) {
     }
 
     std::string err;
-    auto vec = ollama_->Embeddings(model, input, &err);
+    auto resolved = providers_ ? providers_->Resolve(model) : std::nullopt;
+    if (!resolved) return SendJson(&res, 400, MakeError("unknown provider in model", "invalid_request_error"));
+    auto vec = resolved->provider->Embeddings(resolved->model, input, &err);
     if (!vec) return SendJson(&res, 502, MakeError(err.empty() ? "upstream error" : err, "api_error"));
 
     nlohmann::json out;
@@ -741,28 +745,42 @@ void OpenAiRouter::Register(httplib::Server* server) {
       allowed_tools = tools_.FilterSchemas(names);
     }
 
+    IProvider* provider = nullptr;
+    std::string provider_model = model;
+    if (model != "fake-tool") {
+      auto resolved = providers_->Resolve(model);
+      if (!resolved) return SendJson(&res, 400, MakeError("unknown provider in model", "invalid_request_error"));
+      provider = resolved->provider;
+      provider_model = resolved->model;
+    }
+
     if (!stream) {
       std::string err;
       ToolLoopResult loop;
       if (!allowed_tools.empty()) {
         if (planner) {
           loop =
-              RunPlanner(model, full_messages, allowed_tools, tools_, ollama_, max_plan_steps, max_plan_rewrites, max_tool_calls,
+              RunPlanner(provider_model, full_messages, allowed_tools, tools_, provider, max_plan_steps, max_plan_rewrites,
+                         max_tool_calls,
                          &err);
           if (loop.planner_failed) {
-            loop = RunToolLoop(model, full_messages, allowed_tools, tools_, ollama_, max_steps, max_tool_calls, &err);
+            loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_steps, max_tool_calls, &err);
           }
         } else {
-          loop = RunToolLoop(model, full_messages, allowed_tools, tools_, ollama_, max_steps, max_tool_calls, &err);
+          loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_steps, max_tool_calls, &err);
         }
       } else {
-        OllamaChatRequest oreq;
-        oreq.model = model;
-        oreq.messages = ToOllamaMessages(full_messages);
-        oreq.stream = false;
-        auto oresp = ollama_->ChatOnce(oreq, &err);
-        if (!oresp) return SendJson(&res, 502, MakeError(err.empty() ? "upstream error" : err, "api_error"));
-        loop.final_text = oresp->content;
+        if (model == "fake-tool") {
+          loop.final_text = FakeModelOnce(full_messages);
+        } else {
+          ChatRequest req;
+          req.model = provider_model;
+          req.stream = false;
+          req.messages = full_messages;
+          auto resp = provider->ChatOnce(req, &err);
+          if (!resp) return SendJson(&res, 502, MakeError(err.empty() ? "upstream error" : err, "api_error"));
+          loop.final_text = resp->content;
+        }
       }
       if (loop.final_text.empty() && !err.empty()) return SendJson(&res, 502, MakeError(err, "api_error"));
       if (trace) res.set_header("x-runtime-trace", BuildRuntimeTrace(loop).dump());
@@ -810,21 +828,25 @@ void OpenAiRouter::Register(httplib::Server* server) {
     if (!allowed_tools.empty()) {
       if (planner) {
         loop =
-            RunPlanner(model, full_messages, allowed_tools, tools_, ollama_, max_plan_steps, max_plan_rewrites, max_tool_calls,
-                       &err);
+            RunPlanner(provider_model, full_messages, allowed_tools, tools_, provider, max_plan_steps, max_plan_rewrites,
+                       max_tool_calls, &err);
         if (loop.planner_failed) {
-          loop = RunToolLoop(model, full_messages, allowed_tools, tools_, ollama_, max_steps, max_tool_calls, &err);
+          loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_steps, max_tool_calls, &err);
         }
       } else {
-        loop = RunToolLoop(model, full_messages, allowed_tools, tools_, ollama_, max_steps, max_tool_calls, &err);
+        loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_steps, max_tool_calls, &err);
       }
     } else {
-      OllamaChatRequest oreq;
-      oreq.model = model;
-      oreq.messages = ToOllamaMessages(full_messages);
-      oreq.stream = false;
-      auto oresp = ollama_->ChatOnce(oreq, &err);
-      if (oresp) loop.final_text = oresp->content;
+      if (model == "fake-tool") {
+        loop.final_text = FakeModelOnce(full_messages);
+      } else {
+        ChatRequest req;
+        req.model = provider_model;
+        req.stream = false;
+        req.messages = full_messages;
+        auto resp = provider->ChatOnce(req, &err);
+        if (resp) loop.final_text = resp->content;
+      }
     }
 
     if (!err.empty() && loop.final_text.empty()) {
@@ -935,14 +957,21 @@ void OpenAiRouter::Register(httplib::Server* server) {
       return SendJson(&res, 400, MakeError("missing field: input", "invalid_request_error"));
     }
 
-    OllamaChatRequest oreq;
-    oreq.model = model;
-    oreq.stream = false;
-    oreq.messages = {{std::string("user"), input}};
-
     std::string err;
-    auto oresp = ollama_->ChatOnce(oreq, &err);
-    if (!oresp) return SendJson(&res, 502, MakeError(err.empty() ? "upstream error" : err, "api_error"));
+    std::string content;
+    if (model == "fake-tool") {
+      content = FakeModelOnce({ChatMessage{"user", input}});
+    } else {
+      auto resolved = providers_ ? providers_->Resolve(model) : std::nullopt;
+      if (!resolved) return SendJson(&res, 400, MakeError("unknown provider in model", "invalid_request_error"));
+      ChatRequest creq;
+      creq.model = resolved->model;
+      creq.stream = false;
+      creq.messages = {ChatMessage{"user", input}};
+      auto resp = resolved->provider->ChatOnce(creq, &err);
+      if (!resp) return SendJson(&res, 502, MakeError(err.empty() ? "upstream error" : err, "api_error"));
+      content = resp->content;
+    }
 
     nlohmann::json out;
     out["id"] = NewId("resp");
@@ -955,7 +984,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
     msg["type"] = "message";
     msg["role"] = "assistant";
     msg["content"] = nlohmann::json::array();
-    msg["content"].push_back({{"type", "output_text"}, {"text", oresp->content}});
+    msg["content"].push_back({{"type", "output_text"}, {"text", content}});
     out["output"].push_back(std::move(msg));
     SendJson(&res, 200, out);
   });

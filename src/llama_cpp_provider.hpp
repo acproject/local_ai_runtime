@@ -1,13 +1,19 @@
 #pragma once
 
-#include "config.hpp"
 #include "providers/provider.hpp"
+
+#include <mutex>
+#include <string>
+
+struct llama_context;
+struct llama_model;
 
 namespace runtime {
 
-class OllamaProvider : public IProvider {
+class LlamaCppProvider : public IProvider {
  public:
-  explicit OllamaProvider(HttpEndpoint endpoint);
+  explicit LlamaCppProvider(std::string model_path);
+  ~LlamaCppProvider() override;
 
   std::string Name() const override;
   std::vector<ModelInfo> ListModels(std::string* err) override;
@@ -20,7 +26,16 @@ class OllamaProvider : public IProvider {
                   std::string* err) override;
 
  private:
-  HttpEndpoint endpoint_;
+  bool EnsureLoaded(std::string* err);
+  std::string BuildPrompt(const std::vector<ChatMessage>& messages) const;
+
+  std::string model_path_;
+  std::string model_id_;
+
+  mutable std::mutex mu_;
+  llama_model* model_ = nullptr;
+  llama_context* ctx_ = nullptr;
 };
 
 }  // namespace runtime
+

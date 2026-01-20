@@ -3,16 +3,17 @@
 #include "config.hpp"
 #include "providers/provider.hpp"
 
+#include <string>
+
 namespace runtime {
 
-class OllamaProvider : public IProvider {
+class OpenAiCompatibleHttpProvider : public IProvider {
  public:
-  explicit OllamaProvider(HttpEndpoint endpoint);
+  OpenAiCompatibleHttpProvider(std::string name, HttpEndpoint endpoint);
 
   std::string Name() const override;
   std::vector<ModelInfo> ListModels(std::string* err) override;
   std::optional<std::vector<double>> Embeddings(const std::string& model, const std::string& input, std::string* err) override;
-
   std::optional<ChatResponse> ChatOnce(const ChatRequest& req, std::string* err) override;
   bool ChatStream(const ChatRequest& req,
                   const std::function<void(const std::string&)>& on_delta,
@@ -20,7 +21,9 @@ class OllamaProvider : public IProvider {
                   std::string* err) override;
 
  private:
+  std::string name_;
   HttpEndpoint endpoint_;
 };
 
 }  // namespace runtime
+

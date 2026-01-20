@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ollama_provider.hpp"
+#include "providers/registry.hpp"
 #include "session_manager.hpp"
 #include "tooling.hpp"
 
@@ -12,13 +12,13 @@ namespace runtime {
 
 class OpenAiRouter {
  public:
-  OpenAiRouter(SessionManager* sessions, OllamaProvider* ollama, ToolRegistry tools);
+  OpenAiRouter(SessionManager* sessions, ProviderRegistry* providers, ToolRegistry tools);
   void Register(httplib::Server* server);
   ToolRegistry* MutableTools();
 
  private:
   SessionManager* sessions_;
-  OllamaProvider* ollama_;
+  ProviderRegistry* providers_;
   ToolRegistry tools_;
 };
 

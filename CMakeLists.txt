@@ -8,6 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(FetchContent)
 
+option(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP "Build with llama.cpp provider" ON)
+
 FetchContent_Declare(
   cpp_httplib
   URL https://raw.githubusercontent.com/yhirose/cpp-httplib/v0.15.3/httplib.h
@@ -33,10 +35,21 @@ configure_file(
 add_library(nlohmann-json INTERFACE)
 target_include_directories(nlohmann-json INTERFACE ${nlohmann_json_SOURCE_DIR})
 
+if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
+  FetchContent_Declare(
+    llama_cpp
+    GIT_REPOSITORY https://github.com/ggerganov/llama.cpp.git
+    GIT_TAG b4126
+  )
+  FetchContent_MakeAvailable(llama_cpp)
+endif()
+
 add_executable(local-ai-runtime
   src/config.cpp
   src/main.cpp
   src/mcp_client.cpp
+  src/llama_cpp_provider.cpp
+  src/openai_compatible_http_provider.cpp
   src/ollama_provider.cpp
   src/openai_router.cpp
   src/session_manager.cpp
@@ -45,6 +58,10 @@ add_executable(local-ai-runtime
 
 target_include_directories(local-ai-runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(local-ai-runtime PRIVATE cpp-httplib nlohmann-json)
+
+if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
+  target_link_libraries(local-ai-runtime PRIVATE llama)
+endif()
 
 if(MSVC)
   target_compile_options(local-ai-runtime PRIVATE /W4)

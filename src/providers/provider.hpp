@@ -1,0 +1,47 @@
+#pragma once
+
+#include "session_manager.hpp"
+
+#include <functional>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace runtime {
+
+struct ModelInfo {
+  std::string id;
+  std::string owned_by;
+};
+
+struct ChatRequest {
+  std::string model;
+  std::vector<ChatMessage> messages;
+  bool stream = false;
+};
+
+struct ChatResponse {
+  std::string model;
+  std::string content;
+  bool done = true;
+};
+
+class IProvider {
+ public:
+  virtual ~IProvider() = default;
+
+  virtual std::string Name() const = 0;
+  virtual std::vector<ModelInfo> ListModels(std::string* err) = 0;
+  virtual std::optional<std::vector<double>> Embeddings(const std::string& model,
+                                                        const std::string& input,
+                                                        std::string* err) = 0;
+
+  virtual std::optional<ChatResponse> ChatOnce(const ChatRequest& req, std::string* err) = 0;
+  virtual bool ChatStream(const ChatRequest& req,
+                          const std::function<void(const std::string&)>& on_delta,
+                          const std::function<void()>& on_done,
+                          std::string* err) = 0;
+};
+
+}  // namespace runtime
+

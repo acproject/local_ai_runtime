@@ -11,7 +11,7 @@ static bool StartsWith(const std::string& s, const std::string& prefix) {
   return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
 }
 
-static HttpEndpoint ParseHttpEndpoint(const std::string& url) {
+static HttpEndpoint ParseHttpEndpoint(const std::string& url, int default_port) {
   HttpEndpoint ep;
   std::string s = url;
   if (StartsWith(s, "http://")) {
@@ -36,7 +36,7 @@ static HttpEndpoint ParseHttpEndpoint(const std::string& url) {
     ep.host = s;
   }
   if (ep.base_path.empty()) ep.base_path = "";
-  if (ep.port == 0) ep.port = 11434;
+  if (ep.port == 0) ep.port = default_port;
   if (ep.host.empty()) ep.host = "127.0.0.1";
   return ep;
 }
@@ -77,12 +77,27 @@ RuntimeConfig LoadConfigFromEnv() {
   if (auto host = GetEnvStr("RUNTIME_LISTEN_HOST"); !host.empty()) cfg.listen.host = host;
   if (auto port = GetEnvStr("RUNTIME_LISTEN_PORT"); !port.empty()) cfg.listen.port = std::atoi(port.c_str());
 
+  if (auto p = GetEnvStr("RUNTIME_PROVIDER"); !p.empty()) cfg.default_provider = p;
+  if (auto model = GetEnvStr("LLAMA_CPP_MODEL"); !model.empty()) cfg.llama_cpp_model_path = model;
+
   auto ollama = GetEnvStr("OLLAMA_HOST");
-  if (!ollama.empty()) cfg.ollama = ParseHttpEndpoint(ollama);
+  if (!ollama.empty()) cfg.ollama = ParseHttpEndpoint(ollama, 11434);
+
+  auto mnn = GetEnvStr("MNN_HOST");
+  if (!mnn.empty()) {
+    cfg.mnn = ParseHttpEndpoint(mnn, 8000);
+    cfg.mnn_enabled = true;
+  }
+
+  auto lmdeploy = GetEnvStr("LMDEPLOY_HOST");
+  if (!lmdeploy.empty()) {
+    cfg.lmdeploy = ParseHttpEndpoint(lmdeploy, 23333);
+    cfg.lmdeploy_enabled = true;
+  }
 
   auto mcp = GetEnvStr("MCP_HOST");
   if (!mcp.empty()) {
-    cfg.mcp = ParseHttpEndpoint(mcp);
+    cfg.mcp = ParseHttpEndpoint(mcp, 9000);
     cfg.mcp_enabled = true;
   }
 
@@ -90,7 +105,7 @@ RuntimeConfig LoadConfigFromEnv() {
   if (!mcp_hosts.empty()) {
     cfg.mcp_hosts.clear();
     for (const auto& url : SplitCsv(mcp_hosts)) {
-      cfg.mcp_hosts.push_back(ParseHttpEndpoint(url));
+      cfg.mcp_hosts.push_back(ParseHttpEndpoint(url, 9000));
     }
     if (!cfg.mcp_hosts.empty()) cfg.mcp_enabled = true;
   }

@@ -20,7 +20,13 @@ struct HttpEndpoint {
 
 struct RuntimeConfig {
   HttpListenConfig listen;
+  std::string default_provider = "llama_cpp";
+  std::string llama_cpp_model_path;
   HttpEndpoint ollama;
+  HttpEndpoint mnn;
+  HttpEndpoint lmdeploy;
+  bool mnn_enabled = false;
+  bool lmdeploy_enabled = false;
   HttpEndpoint mcp;
   bool mcp_enabled = false;
   std::vector<HttpEndpoint> mcp_hosts;

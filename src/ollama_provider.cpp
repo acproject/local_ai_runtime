@@ -27,6 +27,10 @@ static std::string JoinPath(const std::string& base, const std::string& path) {
 
 OllamaProvider::OllamaProvider(HttpEndpoint endpoint) : endpoint_(std::move(endpoint)) {}
 
+std::string OllamaProvider::Name() const {
+  return "ollama";
+}
+
 std::vector<ModelInfo> OllamaProvider::ListModels(std::string* err) {
   auto cli = MakeClient(endpoint_);
   auto res = cli->Get(JoinPath(endpoint_.base_path, "/api/tags"));
@@ -85,7 +89,7 @@ std::optional<std::vector<double>> OllamaProvider::Embeddings(const std::string&
   return vec;
 }
 
-std::optional<OllamaChatResponse> OllamaProvider::ChatOnce(const OllamaChatRequest& req, std::string* err) {
+std::optional<ChatResponse> OllamaProvider::ChatOnce(const ChatRequest& req, std::string* err) {
   auto cli = MakeClient(endpoint_);
   nlohmann::json j;
   j["model"] = req.model;
@@ -111,7 +115,7 @@ std::optional<OllamaChatResponse> OllamaProvider::ChatOnce(const OllamaChatReque
     if (err) *err = "ollama: invalid json from /api/chat";
     return std::nullopt;
   }
-  OllamaChatResponse out;
+  ChatResponse out;
   out.model = req.model;
   if (jr["message"].contains("content") && jr["message"]["content"].is_string()) {
     out.content = jr["message"]["content"].get<std::string>();
@@ -120,7 +124,7 @@ std::optional<OllamaChatResponse> OllamaProvider::ChatOnce(const OllamaChatReque
   return out;
 }
 
-bool OllamaProvider::ChatStream(const OllamaChatRequest& req,
+bool OllamaProvider::ChatStream(const ChatRequest& req,
                                 const std::function<void(const std::string&)>& on_delta,
                                 const std::function<void()>& on_done,
                                 std::string* err) {
