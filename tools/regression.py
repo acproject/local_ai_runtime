@@ -96,6 +96,8 @@ def main():
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["NO_PROXY"] = "127.0.0.1,localhost"
+    env["no_proxy"] = "127.0.0.1,localhost"
 
     mcp = start_process([sys.executable, "tools/mock_mcp_server.py", "--port", str(args.mcp_port), "--mode", "lsp"], env=env)
     openai = start_process([sys.executable, "tools/mock_openai_server.py", "--port", str(args.openai_port)], env=env)
@@ -113,6 +115,18 @@ def main():
         renv["RUNTIME_PROVIDER"] = "mnn"
         renv["MNN_HOST"] = f"http://127.0.0.1:{args.openai_port}"
         renv["LMDEPLOY_HOST"] = f"http://127.0.0.1:{args.openai_port}"
+        if os.name == "nt":
+            rt_path = os.path.abspath(args.runtime)
+            rt_dir = os.path.dirname(rt_path)
+            base_dir = os.path.dirname(rt_dir)
+            dll_dirs = [
+                rt_dir,
+                os.path.join(base_dir, "bin", "Release"),
+                os.path.join(base_dir, "bin", "Debug"),
+            ]
+            dll_dirs = [p for p in dll_dirs if os.path.isdir(p)]
+            if dll_dirs:
+                renv["PATH"] = os.pathsep.join(dll_dirs + [renv.get("PATH", "")])
         rt = start_process([args.runtime], env=renv)
         try:
             if not wait_ready(f"http://127.0.0.1:{args.runtime_port}/v1/models", timeout_s=3, method="GET"):

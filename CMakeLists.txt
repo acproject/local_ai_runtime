@@ -2,10 +2,6 @@ cmake_minimum_required(VERSION 3.20)
 
 project(local_ai_runtime LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-
 include(FetchContent)
 
 option(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP "Build with llama.cpp provider" ON)
@@ -54,6 +50,12 @@ add_executable(local-ai-runtime
   src/openai_router.cpp
   src/session_manager.cpp
   src/tooling.cpp
+)
+
+set_target_properties(local-ai-runtime PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED YES
+  CXX_EXTENSIONS NO
 )
 
 target_include_directories(local-ai-runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

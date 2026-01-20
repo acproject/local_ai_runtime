@@ -136,18 +136,18 @@ int main() {
     refresh_mcp_tools();
   }
 
+  auto call_any_mcp = [&](const std::string& tool_name, const nlohmann::json& args, std::string* err) {
+    for (const auto& mcp : mcp_servers) {
+      std::string call_err;
+      auto r = mcp->CallTool(tool_name, args, &call_err);
+      if (r) return r;
+      if (err) *err = call_err;
+    }
+    return std::optional<nlohmann::json>();
+  };
+
   if (!mcp_servers.empty()) {
     auto* tools = router.MutableTools();
-
-    auto call_any_mcp = [&](const std::string& tool_name, const nlohmann::json& args, std::string* err) {
-      for (const auto& mcp : mcp_servers) {
-        std::string call_err;
-        auto r = mcp->CallTool(tool_name, args, &call_err);
-        if (r) return r;
-        if (err) *err = call_err;
-      }
-      return std::optional<nlohmann::json>();
-    };
 
     {
       runtime::ToolSchema schema;
