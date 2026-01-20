@@ -1,0 +1,54 @@
+# CMake build directories
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CMakeScripts/
+Testing/
+Makefile
+*.cmake
+install_manifest.txt
+
+# Compiled files
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.out
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Debug files
+*.pdb
+*.ilk
+*.exp
+*.map
+
+# Dependencies
+vcpkg_installed/
+conan_build/
+web/node_modules
+web/node_modules/**
