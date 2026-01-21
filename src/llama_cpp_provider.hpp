@@ -3,7 +3,10 @@
 #include "providers/provider.hpp"
 
 #include <mutex>
+#include <optional>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 struct llama_context;
 struct llama_model;
@@ -26,13 +29,18 @@ class LlamaCppProvider : public IProvider {
                   std::string* err) override;
 
  private:
-  bool EnsureLoaded(std::string* err);
+  void BuildModelIndex();
+  std::optional<std::string> ResolveModelPath(const std::string& requested_model, std::string* err) const;
+  bool EnsureLoaded(const std::string& model_path, std::string* err);
   std::string BuildPrompt(const std::vector<ChatMessage>& messages) const;
 
-  std::string model_path_;
-  std::string model_id_;
+  std::string model_root_;
+  bool root_is_dir_ = false;
+  std::unordered_map<std::string, std::string> model_paths_by_id_;
+  std::vector<std::string> model_ids_;
 
   mutable std::mutex mu_;
+  std::string loaded_model_path_;
   llama_model* model_ = nullptr;
   llama_context* ctx_ = nullptr;
 };

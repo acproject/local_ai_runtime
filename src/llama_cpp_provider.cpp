@@ -4,8 +4,11 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace runtime {
@@ -16,6 +19,18 @@ static std::string BasenameNoExt(const std::string& path) {
   auto stem = p.stem().string();
   if (!stem.empty()) return stem;
   return p.filename().string();
+}
+
+static bool IsFirstShardFile(const std::filesystem::path& p) {
+  const std::string stem = p.stem().string();
+  return stem.find("-00001-of-") != std::string::npos;
+}
+
+static bool PreferModelFile(const std::filesystem::path& cand, const std::filesystem::path& cur) {
+  const bool c1 = IsFirstShardFile(cand);
+  const bool c2 = IsFirstShardFile(cur);
+  if (c1 != c2) return c1;
+  return cand.filename().string() < cur.filename().string();
 }
 
 static llama_token SampleGreedy(const float* logits, int n_vocab) {
@@ -44,8 +59,15 @@ static std::string TokenToPiece(const llama_model* model, llama_token tok) {
 
 }  // namespace
 
-LlamaCppProvider::LlamaCppProvider(std::string model_path) : model_path_(std::move(model_path)) {
-  model_id_ = BasenameNoExt(model_path_);
+LlamaCppProvider::LlamaCppProvider(std::string model_path) : model_root_(std::move(model_path)) {
+  if (model_root_.empty()) {
+    std::filesystem::path fallback = std::filesystem::path("models");
+    std::error_code ec;
+    if (std::filesystem::exists(fallback, ec) && std::filesystem::is_directory(fallback, ec)) {
+      model_root_ = fallback.string();
+    }
+  }
+  BuildModelIndex();
 }
 
 LlamaCppProvider::~LlamaCppProvider() {
@@ -65,14 +87,19 @@ std::string LlamaCppProvider::Name() const {
 }
 
 std::vector<ModelInfo> LlamaCppProvider::ListModels(std::string* err) {
-  if (model_path_.empty()) {
+  if (model_ids_.empty()) {
     if (err) *err = "llama_cpp: missing model path";
     return {};
   }
-  ModelInfo m;
-  m.id = model_id_.empty() ? "default" : model_id_;
-  m.owned_by = "llama_cpp";
-  return {m};
+  std::vector<ModelInfo> out;
+  out.reserve(model_ids_.size());
+  for (const auto& id : model_ids_) {
+    ModelInfo m;
+    m.id = id;
+    m.owned_by = "llama_cpp";
+    out.push_back(std::move(m));
+  }
+  return out;
 }
 
 std::optional<std::vector<double>> LlamaCppProvider::Embeddings(const std::string&, const std::string&, std::string* err) {
@@ -80,16 +107,120 @@ std::optional<std::vector<double>> LlamaCppProvider::Embeddings(const std::strin
   return std::nullopt;
 }
 
-bool LlamaCppProvider::EnsureLoaded(std::string* err) {
-  if (model_) return true;
-  if (model_path_.empty()) {
+void LlamaCppProvider::BuildModelIndex() {
+  model_paths_by_id_.clear();
+  model_ids_.clear();
+  root_is_dir_ = false;
+
+  if (model_root_.empty()) return;
+
+  std::filesystem::path root(model_root_);
+  std::error_code ec;
+  if (!std::filesystem::exists(root, ec)) return;
+
+  if (std::filesystem::is_directory(root, ec)) {
+    root_is_dir_ = true;
+    for (std::filesystem::recursive_directory_iterator it(root, ec), end; it != end; it.increment(ec)) {
+      if (ec) break;
+      if (!it->is_regular_file(ec)) continue;
+      auto p = it->path();
+      auto ext = p.extension().string();
+      std::transform(ext.begin(), ext.end(), ext.begin(),
+                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      if (ext != ".gguf") continue;
+
+      auto rel_dir = std::filesystem::relative(p.parent_path(), root, ec);
+      if (ec) continue;
+
+      std::string id;
+      if (rel_dir.empty() || rel_dir == ".") {
+        id = root.filename().string();
+        if (id.empty()) id = BasenameNoExt(p.string());
+      } else {
+        id = rel_dir.generic_string();
+      }
+      if (id.empty()) continue;
+
+      auto existing = model_paths_by_id_.find(id);
+      if (existing == model_paths_by_id_.end()) {
+        model_paths_by_id_[id] = p.string();
+      } else {
+        std::filesystem::path cur(existing->second);
+        if (PreferModelFile(p, cur)) existing->second = p.string();
+      }
+    }
+  } else if (std::filesystem::is_regular_file(root, ec)) {
+    root_is_dir_ = false;
+    std::string id = BasenameNoExt(root.string());
+    if (!id.empty()) model_paths_by_id_[id] = root.string();
+  }
+
+  model_ids_.reserve(model_paths_by_id_.size());
+  for (const auto& [id, _] : model_paths_by_id_) model_ids_.push_back(id);
+  std::sort(model_ids_.begin(), model_ids_.end());
+}
+
+std::optional<std::string> LlamaCppProvider::ResolveModelPath(const std::string& requested_model, std::string* err) const {
+  if (model_ids_.empty()) {
+    if (err) *err = "llama_cpp: missing model path";
+    return std::nullopt;
+  }
+
+  if (requested_model == "any" && model_ids_.size() == 1) {
+    const auto& only_id = model_ids_[0];
+    auto it = model_paths_by_id_.find(only_id);
+    if (it == model_paths_by_id_.end()) {
+      if (err) *err = "llama_cpp: missing model path";
+      return std::nullopt;
+    }
+    return it->second;
+  }
+
+  if (!root_is_dir_) {
+    const auto& only_id = model_ids_[0];
+    if (!requested_model.empty() && requested_model != only_id) {
+      if (err) *err = "llama_cpp: unknown model";
+      return std::nullopt;
+    }
+    auto it = model_paths_by_id_.find(only_id);
+    if (it == model_paths_by_id_.end()) {
+      if (err) *err = "llama_cpp: missing model path";
+      return std::nullopt;
+    }
+    return it->second;
+  }
+
+  auto it = model_paths_by_id_.find(requested_model);
+  if (it == model_paths_by_id_.end()) {
+    if (err) *err = "llama_cpp: unknown model";
+    return std::nullopt;
+  }
+  return it->second;
+}
+
+bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* err) {
+  if (model_ && ctx_ && loaded_model_path_ == model_path) return true;
+
+  if (ctx_) {
+    llama_free(ctx_);
+    ctx_ = nullptr;
+  }
+  if (model_) {
+    llama_free_model(model_);
+    model_ = nullptr;
+  }
+  loaded_model_path_.clear();
+
+  if (model_path.empty()) {
     if (err) *err = "llama_cpp: missing model path";
     return false;
   }
-  llama_backend_init();
+
+  static std::once_flag init_once;
+  std::call_once(init_once, [] { llama_backend_init(); });
 
   llama_model_params mparams = llama_model_default_params();
-  model_ = llama_load_model_from_file(model_path_.c_str(), mparams);
+  model_ = llama_load_model_from_file(model_path.c_str(), mparams);
   if (!model_) {
     if (err) *err = "llama_cpp: failed to load model";
     return false;
@@ -103,6 +234,7 @@ bool LlamaCppProvider::EnsureLoaded(std::string* err) {
     if (err) *err = "llama_cpp: failed to create context";
     return false;
   }
+  loaded_model_path_ = model_path;
   return true;
 }
 
@@ -142,7 +274,9 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
                                   const std::function<void()>& on_done,
                                   std::string* err) {
   std::lock_guard<std::mutex> lock(mu_);
-  if (!EnsureLoaded(err)) return false;
+  auto model_path = ResolveModelPath(req.model, err);
+  if (!model_path) return false;
+  if (!EnsureLoaded(*model_path, err)) return false;
 
   llama_kv_cache_clear(ctx_);
 
