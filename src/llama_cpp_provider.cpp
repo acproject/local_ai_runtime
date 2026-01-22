@@ -359,6 +359,9 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
   llama_context_params cparams = llama_context_default_params();
   cparams.n_ctx = 4096;
   cparams.n_threads = std::max(1u, std::thread::hardware_concurrency());
+  cparams.n_threads_batch = cparams.n_threads;
+  cparams.n_batch = std::min<uint32_t>(2048, cparams.n_ctx);
+  cparams.n_ubatch = cparams.n_batch;
   ctx_ = llama_init_from_model(model_, cparams);
   if (!ctx_) {
     if (err) *err = "llama_cpp: failed to create context";
@@ -469,22 +472,39 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   }
   prompt_tokens.resize(static_cast<size_t>(n_prompt));
 
-  llama_batch batch = llama_batch_init(static_cast<int>(prompt_tokens.size()), 0, 1);
-  batch.n_tokens = 0;
-  for (size_t i = 0; i < prompt_tokens.size(); i++) {
-    batch.token[batch.n_tokens] = prompt_tokens[i];
-    batch.pos[batch.n_tokens] = static_cast<llama_pos>(i);
-    batch.n_seq_id[batch.n_tokens] = 1;
-    batch.seq_id[batch.n_tokens][0] = 0;
-    batch.logits[batch.n_tokens] = (i + 1 == prompt_tokens.size());
-    batch.n_tokens++;
+  const uint32_t n_ctx = llama_n_ctx(ctx_);
+  if (n_ctx > 0 && prompt_tokens.size() >= n_ctx) {
+    const size_t keep = n_ctx > 1 ? static_cast<size_t>(n_ctx - 1) : 0;
+    if (keep == 0) {
+      if (err) *err = "llama_cpp: prompt too long";
+      return false;
+    }
+    const size_t drop = prompt_tokens.size() - keep;
+    prompt_tokens.erase(prompt_tokens.begin(), prompt_tokens.begin() + static_cast<std::ptrdiff_t>(drop));
   }
-  if (llama_decode(ctx_, batch) != 0) {
+
+  const uint32_t n_batch_u = llama_n_batch(ctx_);
+  const size_t n_batch = n_batch_u > 0 ? static_cast<size_t>(n_batch_u) : 512;
+  for (size_t start = 0; start < prompt_tokens.size();) {
+    const size_t chunk = std::min(n_batch, prompt_tokens.size() - start);
+    llama_batch batch = llama_batch_init(static_cast<int>(chunk), 0, 1);
+    for (size_t i = 0; i < chunk; i++) {
+      const size_t idx = start + i;
+      batch.token[i] = prompt_tokens[idx];
+      batch.pos[i] = static_cast<llama_pos>(idx);
+      batch.n_seq_id[i] = 1;
+      batch.seq_id[i][0] = 0;
+      batch.logits[i] = (idx + 1 == prompt_tokens.size());
+    }
+    batch.n_tokens = static_cast<int>(chunk);
+    if (llama_decode(ctx_, batch) != 0) {
+      llama_batch_free(batch);
+      if (err) *err = "llama_cpp: decode failed";
+      return false;
+    }
     llama_batch_free(batch);
-    if (err) *err = "llama_cpp: decode failed";
-    return false;
+    start += chunk;
   }
-  llama_batch_free(batch);
 
   const int n_vocab = llama_vocab_n_tokens(vocab);
   const llama_token eos = llama_vocab_eos(vocab);
