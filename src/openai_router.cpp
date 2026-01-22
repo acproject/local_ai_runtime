@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -12,6 +13,40 @@ namespace {
 
 static int64_t NowSeconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static std::string GetEnvStr(const char* name) {
+  const char* v = std::getenv(name);
+  return v ? std::string(v) : std::string();
+}
+
+static std::string ToLowerAscii(std::string s) {
+  for (char& c : s) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  return s;
+}
+
+static std::string NormalizePrefix(std::string p) {
+  if (p.empty()) return {};
+  if (p == "/") return {};
+  if (!p.empty() && p.back() == '/') p.pop_back();
+  if (p.empty()) return {};
+  if (p.front() != '/') p.insert(p.begin(), '/');
+  return p;
+}
+
+static std::vector<std::string> GetApiPrefixes() {
+  std::string mode = ToLowerAscii(GetEnvStr("RUNTIME_API_PREFIX_MODE"));
+  if (mode.empty()) mode = "auto";
+
+  if (mode == "v1" || mode == "none" || mode == "off") {
+    return {""};
+  }
+  if (mode == "api") {
+    return {"/api"};
+  }
+  return {"", "/api"};
 }
 
 static nlohmann::json MakeError(const std::string& message, const std::string& type) {
@@ -612,7 +647,9 @@ ToolRegistry* OpenAiRouter::MutableTools() {
 }
 
 void OpenAiRouter::Register(httplib::Server* server) {
-  server->Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
+  const auto prefixes = GetApiPrefixes();
+
+  auto models_handler = [&](const httplib::Request&, httplib::Response& res) {
     nlohmann::json out;
     out["object"] = "list";
     out["data"] = nlohmann::json::array();
@@ -636,9 +673,9 @@ void OpenAiRouter::Register(httplib::Server* server) {
       }
     }
     SendJson(&res, 200, out);
-  });
+  };
 
-  server->Post("/v1/embeddings", [&](const httplib::Request& req, httplib::Response& res) {
+  auto embeddings_handler = [&](const httplib::Request& req, httplib::Response& res) {
     auto j = ParseJsonBody(req);
     if (j.is_discarded()) return SendJson(&res, 400, MakeError("invalid json body", "invalid_request_error"));
     if (!j.contains("model") || !j["model"].is_string()) {
@@ -672,9 +709,9 @@ void OpenAiRouter::Register(httplib::Server* server) {
     out["model"] = model;
     out["usage"] = {{"prompt_tokens", nullptr}, {"total_tokens", nullptr}};
     SendJson(&res, 200, out);
-  });
+  };
 
-  server->Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+  auto chat_completions_handler = [&](const httplib::Request& req, httplib::Response& res) {
     auto j = ParseJsonBody(req);
     if (j.is_discarded()) return SendJson(&res, 400, MakeError("invalid json body", "invalid_request_error"));
     if (!j.contains("model") || !j["model"].is_string()) {
@@ -936,9 +973,9 @@ void OpenAiRouter::Register(httplib::Server* server) {
           return true;
         },
         [](bool) {});
-  });
+  };
 
-  server->Post("/v1/responses", [&](const httplib::Request& req, httplib::Response& res) {
+  auto responses_handler = [&](const httplib::Request& req, httplib::Response& res) {
     auto j = ParseJsonBody(req);
     if (j.is_discarded()) return SendJson(&res, 400, MakeError("invalid json body", "invalid_request_error"));
     if (!j.contains("model") || !j["model"].is_string()) {
@@ -987,7 +1024,15 @@ void OpenAiRouter::Register(httplib::Server* server) {
     msg["content"].push_back({{"type", "output_text"}, {"text", content}});
     out["output"].push_back(std::move(msg));
     SendJson(&res, 200, out);
-  });
+  };
+
+  for (const auto& raw_prefix : prefixes) {
+    const auto prefix = NormalizePrefix(raw_prefix);
+    server->Get(prefix + "/v1/models", models_handler);
+    server->Post(prefix + "/v1/embeddings", embeddings_handler);
+    server->Post(prefix + "/v1/chat/completions", chat_completions_handler);
+    server->Post(prefix + "/v1/responses", responses_handler);
+  }
 }
 
 }  // namespace runtime

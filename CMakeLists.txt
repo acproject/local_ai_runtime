@@ -34,8 +34,9 @@ target_include_directories(nlohmann-json INTERFACE ${nlohmann_json_SOURCE_DIR})
 if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
   FetchContent_Declare(
     llama_cpp
-    GIT_REPOSITORY https://github.com/ggerganov/llama.cpp.git
-    GIT_TAG b4126
+    GIT_REPOSITORY https://gitee.com/mirrors/llama-cpp.git
+    GIT_TAG 388ce822415f24c60fcf164a321455f1e008cafb
+    GIT_SHALLOW TRUE
   )
   FetchContent_MakeAvailable(llama_cpp)
 endif()
