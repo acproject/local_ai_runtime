@@ -897,80 +897,102 @@ void OpenAiRouter::Register(httplib::Server* server) {
          this,
          turn = std::move(turn),
          loop = std::move(loop)](size_t, httplib::DataSink& sink) mutable {
-          std::string acc;
-          bool wrote_role = false;
+          try {
+            std::string acc;
+            bool wrote_role = false;
 
-          auto write_chunk = [&](const nlohmann::json& delta, const nlohmann::json& finish_reason) {
-            nlohmann::json chunk;
-            chunk["id"] = id;
-            chunk["object"] = "chat.completion.chunk";
-            chunk["created"] = created;
-            chunk["model"] = model;
-            nlohmann::json choice;
-            choice["index"] = 0;
-            choice["delta"] = delta;
-            choice["finish_reason"] = finish_reason;
-            chunk["choices"] = nlohmann::json::array({choice});
-            auto s = SseData(chunk);
-            sink.write(s.data(), s.size());
-          };
+            auto write_bytes = [&](const std::string& s) -> bool {
+              if (sink.is_writable && !sink.is_writable()) return false;
+              if (!sink.write) return false;
+              return sink.write(s.data(), s.size());
+            };
 
-          constexpr size_t kArgChunk = 48;
-          for (size_t i = 0; i < loop.executed_calls.size(); i++) {
-            const auto& c = loop.executed_calls[i];
-            std::string args = c.arguments_json.empty() ? "{}" : c.arguments_json;
-            for (size_t off = 0; off < args.size(); off += kArgChunk) {
-              const bool first_piece = (off == 0);
-              nlohmann::json tool_delta;
+            auto write_chunk = [&](const nlohmann::json& delta, const nlohmann::json& finish_reason) -> bool {
+              nlohmann::json chunk;
+              chunk["id"] = id;
+              chunk["object"] = "chat.completion.chunk";
+              chunk["created"] = created;
+              chunk["model"] = model;
+              nlohmann::json choice;
+              choice["index"] = 0;
+              choice["delta"] = delta;
+              choice["finish_reason"] = finish_reason;
+              chunk["choices"] = nlohmann::json::array({choice});
+              return write_bytes(SseData(chunk));
+            };
+
+            constexpr size_t kArgChunk = 48;
+            for (size_t i = 0; i < loop.executed_calls.size(); i++) {
+              const auto& c = loop.executed_calls[i];
+              std::string args = c.arguments_json.empty() ? "{}" : c.arguments_json;
+              for (size_t off = 0; off < args.size(); off += kArgChunk) {
+                const bool first_piece = (off == 0);
+                nlohmann::json tool_delta;
+                if (!wrote_role) {
+                  tool_delta["role"] = "assistant";
+                  wrote_role = true;
+                }
+                nlohmann::json tc;
+                tc["index"] = static_cast<int>(i);
+                tc["id"] = c.id;
+                tc["type"] = "function";
+                nlohmann::json func;
+                if (first_piece) func["name"] = c.name;
+                func["arguments"] = args.substr(off, kArgChunk);
+                tc["function"] = std::move(func);
+                tool_delta["tool_calls"] = nlohmann::json::array({tc});
+                if (!write_chunk(tool_delta, nullptr)) {
+                  sink.done();
+                  return false;
+                }
+              }
+            }
+
+            constexpr size_t kTextChunk = 64;
+            for (size_t off = 0; off < loop.final_text.size(); off += kTextChunk) {
+              auto piece = loop.final_text.substr(off, kTextChunk);
+              nlohmann::json delta;
               if (!wrote_role) {
-                tool_delta["role"] = "assistant";
+                delta["role"] = "assistant";
                 wrote_role = true;
               }
-              nlohmann::json tc;
-              tc["index"] = static_cast<int>(i);
-              tc["id"] = c.id;
-              tc["type"] = "function";
-              nlohmann::json func;
-              if (first_piece) func["name"] = c.name;
-              func["arguments"] = args.substr(off, kArgChunk);
-              tc["function"] = std::move(func);
-              tool_delta["tool_calls"] = nlohmann::json::array({tc});
-              write_chunk(tool_delta, nullptr);
+              delta["content"] = piece;
+              if (!write_chunk(delta, nullptr)) {
+                sink.done();
+                return false;
+              }
+              acc += piece;
             }
+
+            if (!write_chunk(nlohmann::json::object(), "stop")) {
+              sink.done();
+              return false;
+            }
+
+            turn.output_text = acc;
+            sessions_->AppendTurn(session_id, turn);
+            if (use_server_history) {
+              sessions_->AppendToHistory(session_id, turn.input_messages);
+              for (const auto& tc : loop.executed_calls) {
+                sessions_->AppendToHistory(session_id,
+                                           {ChatMessage{"assistant", "TOOL_CALL " + tc.name + " " + tc.arguments_json}});
+              }
+              for (const auto& tr : loop.results) {
+                sessions_->AppendToHistory(session_id, {ChatMessage{"user", "TOOL_RESULT " + tr.name + " " + tr.result.dump()}});
+              }
+              sessions_->AppendToHistory(session_id, {ChatMessage{"assistant", acc}});
+            }
+
+            if (!write_bytes(SseDone())) {
+              sink.done();
+              return false;
+            }
+            sink.done();
+            return true;
+          } catch (...) {
+            sink.done();
+            return false;
           }
-
-          constexpr size_t kTextChunk = 64;
-          for (size_t off = 0; off < loop.final_text.size(); off += kTextChunk) {
-            auto piece = loop.final_text.substr(off, kTextChunk);
-            nlohmann::json delta;
-            if (!wrote_role) {
-              delta["role"] = "assistant";
-              wrote_role = true;
-            }
-            delta["content"] = piece;
-            write_chunk(delta, nullptr);
-            acc += piece;
-          }
-
-          write_chunk(nlohmann::json::object(), "stop");
-
-          turn.output_text = acc;
-          sessions_->AppendTurn(session_id, turn);
-          if (use_server_history) {
-            sessions_->AppendToHistory(session_id, turn.input_messages);
-            for (const auto& tc : loop.executed_calls) {
-              sessions_->AppendToHistory(session_id, {ChatMessage{"assistant", "TOOL_CALL " + tc.name + " " + tc.arguments_json}});
-            }
-            for (const auto& tr : loop.results) {
-              sessions_->AppendToHistory(session_id, {ChatMessage{"user", "TOOL_RESULT " + tr.name + " " + tr.result.dump()}});
-            }
-            sessions_->AppendToHistory(session_id, {ChatMessage{"assistant", acc}});
-          }
-
-          auto done = SseDone();
-          sink.write(done.data(), done.size());
-          sink.done();
-          return true;
         },
         [](bool) {});
   };

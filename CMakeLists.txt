@@ -5,6 +5,9 @@ project(local_ai_runtime LANGUAGES CXX)
 include(FetchContent)
 
 option(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP "Build with llama.cpp provider" ON)
+option(LOCAL_AI_RUNTIME_LLAMA_CUDA "Enable CUDA backend for llama.cpp (NVIDIA)" ON)
+option(LOCAL_AI_RUNTIME_LLAMA_VULKAN "Enable Vulkan backend for llama.cpp" OFF)
+set(LOCAL_AI_RUNTIME_CUDA_ARCHITECTURES "" CACHE STRING "CMake CUDA architectures for ggml-cuda (e.g. 86-real;89-real). Empty = safe default")
 
 FetchContent_Declare(
   cpp_httplib
@@ -32,6 +35,18 @@ add_library(nlohmann-json INTERFACE)
 target_include_directories(nlohmann-json INTERFACE ${nlohmann_json_SOURCE_DIR})
 
 if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
+  if(LOCAL_AI_RUNTIME_LLAMA_CUDA)
+    set(GGML_CUDA ON CACHE BOOL "" FORCE)
+    if(LOCAL_AI_RUNTIME_CUDA_ARCHITECTURES STREQUAL "")
+      set(CMAKE_CUDA_ARCHITECTURES "75-virtual;80-virtual;86-real;89-real;120a-real" CACHE STRING "" FORCE)
+    else()
+      set(CMAKE_CUDA_ARCHITECTURES "${LOCAL_AI_RUNTIME_CUDA_ARCHITECTURES}" CACHE STRING "" FORCE)
+    endif()
+  endif()
+  if(LOCAL_AI_RUNTIME_LLAMA_VULKAN)
+    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+  endif()
+
   FetchContent_Declare(
     llama_cpp
     GIT_REPOSITORY https://gitee.com/mirrors/llama-cpp.git
@@ -57,6 +72,8 @@ set_target_properties(local-ai-runtime PROPERTIES
   CXX_STANDARD 20
   CXX_STANDARD_REQUIRED YES
   CXX_EXTENSIONS NO
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"
+  PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"
 )
 
 target_include_directories(local-ai-runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

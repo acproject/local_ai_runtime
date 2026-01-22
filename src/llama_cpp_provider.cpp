@@ -3,6 +3,7 @@
 #include <llama.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <deque>
 #include <cstring>
 #include <filesystem>
@@ -72,6 +73,105 @@ static std::string TrimWs(std::string s) {
   while (i < s.size() && (s[i] == '\n' || s[i] == '\r' || s[i] == ' ' || s[i] == '\t')) i++;
   if (i > 0) s.erase(0, i);
   return s;
+}
+
+static std::string GetEnvStr(const char* name) {
+#if defined(_WIN32)
+  char* buf = nullptr;
+  size_t len = 0;
+  if (_dupenv_s(&buf, &len, name) != 0 || !buf) return {};
+  std::string out(buf);
+  std::free(buf);
+  return out;
+#else
+  const char* v = std::getenv(name);
+  if (!v) return {};
+  return std::string(v);
+#endif
+}
+
+static std::string ToLowerAscii(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return s;
+}
+
+static bool TryParseInt32(const std::string& s, int32_t* out) {
+  if (!out) return false;
+  if (s.empty()) return false;
+  char* end = nullptr;
+  long v = std::strtol(s.c_str(), &end, 10);
+  if (end == s.c_str() || (end && *end != '\0')) return false;
+  if (v < INT32_MIN || v > INT32_MAX) return false;
+  *out = static_cast<int32_t>(v);
+  return true;
+}
+
+static bool TryParseBool(const std::string& s, bool* out) {
+  if (!out) return false;
+  const std::string v = ToLowerAscii(TrimWs(s));
+  if (v == "1" || v == "true" || v == "yes" || v == "y" || v == "on") {
+    *out = true;
+    return true;
+  }
+  if (v == "0" || v == "false" || v == "no" || v == "n" || v == "off") {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
+static std::optional<llama_split_mode> ParseSplitMode(const std::string& s) {
+  const std::string v = ToLowerAscii(TrimWs(s));
+  if (v == "none" || v == "single") return LLAMA_SPLIT_MODE_NONE;
+  if (v == "layer" || v == "layers") return LLAMA_SPLIT_MODE_LAYER;
+  if (v == "row" || v == "rows") return LLAMA_SPLIT_MODE_ROW;
+  return std::nullopt;
+}
+
+struct LlamaGpuOffloadConfig {
+  int32_t n_gpu_layers = 0;
+  std::optional<llama_split_mode> split_mode;
+  std::optional<int32_t> main_gpu;
+  std::optional<bool> offload_kqv;
+  bool requested = false;
+};
+
+static LlamaGpuOffloadConfig LoadLlamaGpuOffloadConfigFromEnv() {
+  LlamaGpuOffloadConfig cfg;
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_N_GPU_LAYERS");
+    if (!v.empty()) {
+      int32_t n = 0;
+      if (TryParseInt32(TrimWs(v), &n)) cfg.n_gpu_layers = n;
+    } else {
+      const std::string v2 = GetEnvStr("LLAMA_CPP_GPU_LAYERS");
+      if (!v2.empty()) {
+        int32_t n = 0;
+        if (TryParseInt32(TrimWs(v2), &n)) cfg.n_gpu_layers = n;
+      }
+    }
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_MAIN_GPU");
+    int32_t n = 0;
+    if (!v.empty() && TryParseInt32(TrimWs(v), &n)) cfg.main_gpu = n;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_SPLIT_MODE");
+    if (!v.empty()) cfg.split_mode = ParseSplitMode(v);
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_OFFLOAD_KQV");
+    bool b = false;
+    if (!v.empty() && TryParseBool(v, &b)) cfg.offload_kqv = b;
+  }
+
+  cfg.requested = (cfg.n_gpu_layers != 0) || (cfg.offload_kqv.has_value() && cfg.offload_kqv.value());
+  return cfg;
 }
 
 static void LlamaLogCallback(enum ggml_log_level level, const char* text, void*) {
@@ -286,6 +386,12 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
     llama_log_set(LlamaLogCallback, nullptr);
   });
 
+  const auto gpu_cfg = LoadLlamaGpuOffloadConfigFromEnv();
+  if (gpu_cfg.requested && !llama_supports_gpu_offload()) {
+    if (err) *err = "llama_cpp: gpu offload requested but not supported in this build";
+    return false;
+  }
+
   static llama_model_kv_override deepseek2_overrides[2]{};
   deepseek2_overrides[0].tag = LLAMA_KV_OVERRIDE_TYPE_FLOAT;
   strncpy_s(deepseek2_overrides[0].key, sizeof(deepseek2_overrides[0].key), "deepseek2.rope.scaling.yarn_log_multiplier", _TRUNCATE);
@@ -317,6 +423,9 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
   auto try_load_with = [&](const llama_model_kv_override* overrides) -> llama_model* {
     llama_model_params p = llama_model_default_params();
     p.kv_overrides = overrides;
+    if (gpu_cfg.n_gpu_layers != 0) p.n_gpu_layers = gpu_cfg.n_gpu_layers;
+    if (gpu_cfg.split_mode.has_value()) p.split_mode = gpu_cfg.split_mode.value();
+    if (gpu_cfg.main_gpu.has_value()) p.main_gpu = gpu_cfg.main_gpu.value();
     p.use_mmap = true;
     auto* m = try_load(p);
     if (!m) {
@@ -362,6 +471,7 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
   cparams.n_threads_batch = cparams.n_threads;
   cparams.n_batch = std::min<uint32_t>(2048, cparams.n_ctx);
   cparams.n_ubatch = cparams.n_batch;
+  if (gpu_cfg.offload_kqv.has_value()) cparams.offload_kqv = gpu_cfg.offload_kqv.value();
   ctx_ = llama_init_from_model(model_, cparams);
   if (!ctx_) {
     if (err) *err = "llama_cpp: failed to create context";
