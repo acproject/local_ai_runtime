@@ -5,7 +5,7 @@ project(local_ai_runtime LANGUAGES CXX)
 include(FetchContent)
 
 option(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP "Build with llama.cpp provider" ON)
-option(LOCAL_AI_RUNTIME_LLAMA_CUDA "Enable CUDA backend for llama.cpp (NVIDIA)" ON)
+option(LOCAL_AI_RUNTIME_LLAMA_CUDA "Enable CUDA backend for llama.cpp (NVIDIA)" OFF)
 option(LOCAL_AI_RUNTIME_LLAMA_VULKAN "Enable Vulkan backend for llama.cpp" OFF)
 set(LOCAL_AI_RUNTIME_CUDA_ARCHITECTURES "" CACHE STRING "CMake CUDA architectures for ggml-cuda (e.g. 86-real;89-real). Empty = safe default")
 

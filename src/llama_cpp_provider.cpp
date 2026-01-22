@@ -3,6 +3,7 @@
 #include <llama.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <cstring>
@@ -106,6 +107,17 @@ static bool TryParseInt32(const std::string& s, int32_t* out) {
   return true;
 }
 
+static bool TryParseUint32(const std::string& s, uint32_t* out) {
+  if (!out) return false;
+  if (s.empty()) return false;
+  char* end = nullptr;
+  unsigned long v = std::strtoul(s.c_str(), &end, 10);
+  if (end == s.c_str() || (end && *end != '\0')) return false;
+  if (v > UINT32_MAX) return false;
+  *out = static_cast<uint32_t>(v);
+  return true;
+}
+
 static bool TryParseBool(const std::string& s, bool* out) {
   if (!out) return false;
   const std::string v = ToLowerAscii(TrimWs(s));
@@ -128,16 +140,30 @@ static std::optional<llama_split_mode> ParseSplitMode(const std::string& s) {
   return std::nullopt;
 }
 
-struct LlamaGpuOffloadConfig {
+static std::optional<llama_flash_attn_type> ParseFlashAttnType(const std::string& s) {
+  const std::string v = ToLowerAscii(TrimWs(s));
+  if (v == "auto") return LLAMA_FLASH_ATTN_TYPE_AUTO;
+  if (v == "enabled" || v == "enable" || v == "1" || v == "true" || v == "on") return LLAMA_FLASH_ATTN_TYPE_ENABLED;
+  if (v == "disabled" || v == "disable" || v == "0" || v == "false" || v == "off") return LLAMA_FLASH_ATTN_TYPE_DISABLED;
+  return std::nullopt;
+}
+
+struct LlamaRuntimeConfig {
   int32_t n_gpu_layers = 0;
   std::optional<llama_split_mode> split_mode;
   std::optional<int32_t> main_gpu;
   std::optional<bool> offload_kqv;
+  std::optional<llama_flash_attn_type> flash_attn;
+  std::optional<uint32_t> n_ctx;
+  std::optional<uint32_t> n_batch;
+  std::optional<uint32_t> n_ubatch;
+  std::optional<int32_t> n_threads;
+  std::optional<int32_t> n_threads_batch;
   bool requested = false;
 };
 
-static LlamaGpuOffloadConfig LoadLlamaGpuOffloadConfigFromEnv() {
-  LlamaGpuOffloadConfig cfg;
+static LlamaRuntimeConfig LoadLlamaRuntimeConfigFromEnv() {
+  LlamaRuntimeConfig cfg;
 
   {
     const std::string v = GetEnvStr("LLAMA_CPP_N_GPU_LAYERS");
@@ -168,6 +194,41 @@ static LlamaGpuOffloadConfig LoadLlamaGpuOffloadConfigFromEnv() {
     const std::string v = GetEnvStr("LLAMA_CPP_OFFLOAD_KQV");
     bool b = false;
     if (!v.empty() && TryParseBool(v, &b)) cfg.offload_kqv = b;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_FLASH_ATTN");
+    if (!v.empty()) cfg.flash_attn = ParseFlashAttnType(v);
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_N_CTX");
+    uint32_t n = 0;
+    if (!v.empty() && TryParseUint32(TrimWs(v), &n) && n > 0) cfg.n_ctx = n;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_N_BATCH");
+    uint32_t n = 0;
+    if (!v.empty() && TryParseUint32(TrimWs(v), &n) && n > 0) cfg.n_batch = n;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_N_UBATCH");
+    uint32_t n = 0;
+    if (!v.empty() && TryParseUint32(TrimWs(v), &n) && n > 0) cfg.n_ubatch = n;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_N_THREADS");
+    int32_t n = 0;
+    if (!v.empty() && TryParseInt32(TrimWs(v), &n) && n > 0) cfg.n_threads = n;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_N_THREADS_BATCH");
+    int32_t n = 0;
+    if (!v.empty() && TryParseInt32(TrimWs(v), &n) && n > 0) cfg.n_threads_batch = n;
   }
 
   cfg.requested = (cfg.n_gpu_layers != 0) || (cfg.offload_kqv.has_value() && cfg.offload_kqv.value());
@@ -386,8 +447,8 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
     llama_log_set(LlamaLogCallback, nullptr);
   });
 
-  const auto gpu_cfg = LoadLlamaGpuOffloadConfigFromEnv();
-  if (gpu_cfg.requested && !llama_supports_gpu_offload()) {
+  const auto cfg = LoadLlamaRuntimeConfigFromEnv();
+  if (cfg.requested && !llama_supports_gpu_offload()) {
     if (err) *err = "llama_cpp: gpu offload requested but not supported in this build";
     return false;
   }
@@ -423,9 +484,9 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
   auto try_load_with = [&](const llama_model_kv_override* overrides) -> llama_model* {
     llama_model_params p = llama_model_default_params();
     p.kv_overrides = overrides;
-    if (gpu_cfg.n_gpu_layers != 0) p.n_gpu_layers = gpu_cfg.n_gpu_layers;
-    if (gpu_cfg.split_mode.has_value()) p.split_mode = gpu_cfg.split_mode.value();
-    if (gpu_cfg.main_gpu.has_value()) p.main_gpu = gpu_cfg.main_gpu.value();
+    if (cfg.n_gpu_layers != 0) p.n_gpu_layers = cfg.n_gpu_layers;
+    if (cfg.split_mode.has_value()) p.split_mode = cfg.split_mode.value();
+    if (cfg.main_gpu.has_value()) p.main_gpu = cfg.main_gpu.value();
     p.use_mmap = true;
     auto* m = try_load(p);
     if (!m) {
@@ -466,12 +527,18 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
   }
 
   llama_context_params cparams = llama_context_default_params();
-  cparams.n_ctx = 4096;
-  cparams.n_threads = std::max(1u, std::thread::hardware_concurrency());
-  cparams.n_threads_batch = cparams.n_threads;
-  cparams.n_batch = std::min<uint32_t>(2048, cparams.n_ctx);
-  cparams.n_ubatch = cparams.n_batch;
-  if (gpu_cfg.offload_kqv.has_value()) cparams.offload_kqv = gpu_cfg.offload_kqv.value();
+  cparams.n_ctx = cfg.n_ctx.has_value() ? cfg.n_ctx.value() : 4096;
+  cparams.n_threads = cfg.n_threads.has_value() ? cfg.n_threads.value() : std::max(1u, std::thread::hardware_concurrency());
+  cparams.n_threads_batch = cfg.n_threads_batch.has_value() ? cfg.n_threads_batch.value() : cparams.n_threads;
+  const uint32_t default_batch = cfg.requested ? std::min<uint32_t>(512, cparams.n_ctx) : std::min<uint32_t>(2048, cparams.n_ctx);
+  cparams.n_batch = cfg.n_batch.has_value() ? cfg.n_batch.value() : default_batch;
+  cparams.n_ubatch = cfg.n_ubatch.has_value() ? cfg.n_ubatch.value() : cparams.n_batch;
+  if (cfg.offload_kqv.has_value()) cparams.offload_kqv = cfg.offload_kqv.value();
+  if (cfg.flash_attn.has_value()) {
+    cparams.flash_attn_type = cfg.flash_attn.value();
+  } else if (cfg.requested) {
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+  }
   ctx_ = llama_init_from_model(model_, cparams);
   if (!ctx_) {
     if (err) *err = "llama_cpp: failed to create context";
