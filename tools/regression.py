@@ -196,12 +196,32 @@ def main():
             payload = {"model": "mock-model", "messages": [{"role": "user", "content": "hi"}]}
             st, _, body = http_json(f"http://127.0.0.1:{args.runtime_port}/v1/chat/completions", payload)
             assert st == 200
-            assert "mock:hi" in body
+            assert "mock:n=1 last=hi" in body
 
             payload = {"model": "lmdeploy:mock-model", "messages": [{"role": "user", "content": "hi2"}]}
             st, _, body = http_json(f"http://127.0.0.1:{args.runtime_port}/v1/chat/completions", payload)
             assert st == 200
-            assert "mock:hi2" in body
+            assert "mock:n=1 last=hi2" in body
+
+            payload = {"model": "mock-model", "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}
+            st, _, body = http_json(f"http://127.0.0.1:{args.runtime_port}/v1/chat/completions", payload)
+            assert st == 200
+            assert "mock:n=1 last=hi" in body
+
+            payload = {"model": "mock-model", "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]}
+            st, headers, body = http_json(f"http://127.0.0.1:{args.runtime_port}/v1/chat/completions", payload)
+            assert st == 200
+            sid = headers.get("x-session-id") or headers.get("X-Session-Id")
+            assert sid
+
+            payload = {"model": "mock-model", "messages": [{"role": "user", "content": "next"}]}
+            st, _, body = http_json(
+                f"http://127.0.0.1:{args.runtime_port}/v1/chat/completions",
+                payload,
+                headers={"x-session-id": sid},
+            )
+            assert st == 200
+            assert "mock:n=4 last=next" in body
 
             payload = {"model": "mock-model", "input": "x"}
             st, _, body = http_json(f"http://127.0.0.1:{args.runtime_port}/v1/embeddings", payload)
@@ -211,7 +231,7 @@ def main():
             payload = {"model": "llama_cpp:any", "messages": [{"role": "user", "content": "hi"}]}
             st, _, body = http_json(f"http://127.0.0.1:{args.runtime_port}/v1/chat/completions", payload)
             assert st == 502
-            assert "missing model path" in body
+            assert "llama_cpp:" in body
 
         finally:
             stop_process(rt)

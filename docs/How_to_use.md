@@ -19,6 +19,10 @@ PowerShell 里加这些环境变量（会覆盖默认）：
 - $env:LLAMA_CPP_N_UBATCH="128"
 ```
 
+### 编译
+LOCAL_AI_RUNTIME_WITH_LLAMA_CPP=ON
+cmake --build build-vs2022-x64-cuda --config 
+
 ### API的使用方式
 
 opencode 侧建议把 OpenAI Base URL 指向以下任意一层（路径保持一致）：

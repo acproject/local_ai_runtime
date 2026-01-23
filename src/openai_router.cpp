@@ -765,7 +765,6 @@ void OpenAiRouter::Register(httplib::Server* server) {
       preferred_session_id = req.get_header_value("x-session-id");
       if (preferred_session_id.empty()) preferred_session_id = req.get_header_value("X-Session-Id");
     }
-    const bool session_provided = !preferred_session_id.empty();
     std::string session_id = sessions_->EnsureSessionId(preferred_session_id);
     res.set_header("x-session-id", session_id);
 
@@ -783,7 +782,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
       }
     }
     if (!use_server_history_explicit) {
-      use_server_history = session_provided && !has_assistant;
+      use_server_history = !has_assistant;
     }
 
     std::vector<ChatMessage> full_messages;

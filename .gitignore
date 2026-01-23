@@ -53,3 +53,4 @@ conan_build/
 web/node_modules
 web/node_modules/**
 build-*
+build_*
