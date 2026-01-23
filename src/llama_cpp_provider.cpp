@@ -38,18 +38,6 @@ static bool PreferModelFile(const std::filesystem::path& cand, const std::filesy
   return cand.filename().string() < cur.filename().string();
 }
 
-static llama_token SampleGreedy(const float* logits, int n_vocab) {
-  int best = 0;
-  float best_v = logits[0];
-  for (int i = 1; i < n_vocab; i++) {
-    if (logits[i] > best_v) {
-      best_v = logits[i];
-      best = i;
-    }
-  }
-  return static_cast<llama_token>(best);
-}
-
 static std::string TokenToPiece(const llama_vocab* vocab, llama_token tok) {
   std::string out;
   out.resize(64);
@@ -118,6 +106,16 @@ static bool TryParseUint32(const std::string& s, uint32_t* out) {
   return true;
 }
 
+static bool TryParseFloat(const std::string& s, float* out) {
+  if (!out) return false;
+  if (s.empty()) return false;
+  char* end = nullptr;
+  float v = std::strtof(s.c_str(), &end);
+  if (end == s.c_str() || (end && *end != '\0')) return false;
+  *out = v;
+  return true;
+}
+
 static bool TryParseBool(const std::string& s, bool* out) {
   if (!out) return false;
   const std::string v = ToLowerAscii(TrimWs(s));
@@ -159,6 +157,13 @@ struct LlamaRuntimeConfig {
   std::optional<uint32_t> n_ubatch;
   std::optional<int32_t> n_threads;
   std::optional<int32_t> n_threads_batch;
+  std::optional<bool> unload_after_chat;
+  std::optional<int32_t> max_new_tokens;
+  std::optional<float> temperature;
+  std::optional<float> top_p;
+  std::optional<int32_t> seed;
+  std::optional<int32_t> penalty_last_n;
+  std::optional<float> penalty_repeat;
   bool requested = false;
 };
 
@@ -229,6 +234,50 @@ static LlamaRuntimeConfig LoadLlamaRuntimeConfigFromEnv() {
     const std::string v = GetEnvStr("LLAMA_CPP_N_THREADS_BATCH");
     int32_t n = 0;
     if (!v.empty() && TryParseInt32(TrimWs(v), &n) && n > 0) cfg.n_threads_batch = n;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_UNLOAD_AFTER_CHAT");
+    bool b = false;
+    if (!v.empty() && TryParseBool(v, &b)) cfg.unload_after_chat = b;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_MAX_NEW_TOKENS");
+    const std::string v2 = v.empty() ? GetEnvStr("LLAMA_CPP_MAX_TOKENS") : std::string();
+    const std::string raw = !v.empty() ? v : v2;
+    int32_t n = 0;
+    if (!raw.empty() && TryParseInt32(TrimWs(raw), &n) && n > 0) cfg.max_new_tokens = n;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_TEMPERATURE");
+    float f = 0.0f;
+    if (!v.empty() && TryParseFloat(TrimWs(v), &f) && f >= 0.0f) cfg.temperature = f;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_TOP_P");
+    float f = 0.0f;
+    if (!v.empty() && TryParseFloat(TrimWs(v), &f) && f >= 0.0f && f <= 1.0f) cfg.top_p = f;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_SEED");
+    int32_t n = 0;
+    if (!v.empty() && TryParseInt32(TrimWs(v), &n)) cfg.seed = n;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_PENALTY_LAST_N");
+    int32_t n = 0;
+    if (!v.empty() && TryParseInt32(TrimWs(v), &n)) cfg.penalty_last_n = n;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_REPEAT_PENALTY");
+    float f = 0.0f;
+    if (!v.empty() && TryParseFloat(TrimWs(v), &f) && f > 0.0f) cfg.penalty_repeat = f;
   }
 
   cfg.requested = (cfg.n_gpu_layers != 0) || (cfg.offload_kqv.has_value() && cfg.offload_kqv.value());
@@ -530,13 +579,15 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
   cparams.n_ctx = cfg.n_ctx.has_value() ? cfg.n_ctx.value() : 4096;
   cparams.n_threads = cfg.n_threads.has_value() ? cfg.n_threads.value() : std::max(1u, std::thread::hardware_concurrency());
   cparams.n_threads_batch = cfg.n_threads_batch.has_value() ? cfg.n_threads_batch.value() : cparams.n_threads;
-  const uint32_t default_batch = cfg.requested ? std::min<uint32_t>(512, cparams.n_ctx) : std::min<uint32_t>(2048, cparams.n_ctx);
+  const bool gpu_defaults = llama_supports_gpu_offload();
+  const uint32_t default_batch = gpu_defaults ? std::min<uint32_t>(512, cparams.n_ctx) : std::min<uint32_t>(2048, cparams.n_ctx);
   cparams.n_batch = cfg.n_batch.has_value() ? cfg.n_batch.value() : default_batch;
-  cparams.n_ubatch = cfg.n_ubatch.has_value() ? cfg.n_ubatch.value() : cparams.n_batch;
+  const uint32_t default_ubatch = gpu_defaults ? std::min<uint32_t>(256, cparams.n_batch) : cparams.n_batch;
+  cparams.n_ubatch = cfg.n_ubatch.has_value() ? cfg.n_ubatch.value() : default_ubatch;
   if (cfg.offload_kqv.has_value()) cparams.offload_kqv = cfg.offload_kqv.value();
   if (cfg.flash_attn.has_value()) {
     cparams.flash_attn_type = cfg.flash_attn.value();
-  } else if (cfg.requested) {
+  } else if (gpu_defaults) {
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
   }
   ctx_ = llama_init_from_model(model_, cparams);
@@ -606,7 +657,7 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   if (!model_path) return false;
   if (!EnsureLoaded(*model_path, err)) return false;
 
-  llama_memory_clear(llama_get_memory(ctx_), true);
+  llama_memory_clear(llama_get_memory(ctx_), false);
 
   std::string prompt;
   const char* tmpl = llama_model_chat_template(model_, nullptr);
@@ -639,60 +690,174 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   }
 
   std::vector<llama_token> prompt_tokens;
-  prompt_tokens.resize(prompt.size() + 8);
   const llama_vocab* vocab = llama_model_get_vocab(model_);
-  int n_prompt = llama_tokenize(vocab, prompt.c_str(), static_cast<int>(prompt.size()), prompt_tokens.data(),
-                                static_cast<int>(prompt_tokens.size()), true, true);
-  if (n_prompt < 0) {
+  int n_prompt_guess = llama_tokenize(vocab, prompt.c_str(), static_cast<int>(prompt.size()), nullptr, 0, true, true);
+  if (n_prompt_guess == 0) {
+    if (err) *err = "llama_cpp: tokenize failed";
+    return false;
+  }
+  const int n_prompt = n_prompt_guess < 0 ? -n_prompt_guess : n_prompt_guess;
+  if (n_prompt <= 0) {
     if (err) *err = "llama_cpp: tokenize failed";
     return false;
   }
   prompt_tokens.resize(static_cast<size_t>(n_prompt));
+  const int n_tok = llama_tokenize(vocab, prompt.c_str(), static_cast<int>(prompt.size()), prompt_tokens.data(),
+                                   static_cast<int>(prompt_tokens.size()), true, true);
+  if (n_tok <= 0) {
+    if (err) *err = "llama_cpp: tokenize failed";
+    return false;
+  }
+  prompt_tokens.resize(static_cast<size_t>(n_tok));
 
   const uint32_t n_ctx = llama_n_ctx(ctx_);
-  if (n_ctx > 0 && prompt_tokens.size() >= n_ctx) {
-    const size_t keep = n_ctx > 1 ? static_cast<size_t>(n_ctx - 1) : 0;
+  const auto gen_cfg = LoadLlamaRuntimeConfigFromEnv();
+  const int max_new_tokens_requested = gen_cfg.max_new_tokens.has_value() ? gen_cfg.max_new_tokens.value() : 128;
+  const int penalty_last_n = gen_cfg.penalty_last_n.has_value() ? gen_cfg.penalty_last_n.value() : 64;
+  const float penalty_repeat = gen_cfg.penalty_repeat.has_value() ? gen_cfg.penalty_repeat.value() : 1.1f;
+  const float temperature = gen_cfg.temperature.has_value() ? gen_cfg.temperature.value() : 0.0f;
+  const float top_p = gen_cfg.top_p.has_value() ? gen_cfg.top_p.value() : 0.0f;
+  const int32_t seed = gen_cfg.seed.has_value() ? gen_cfg.seed.value() : static_cast<int32_t>(LLAMA_DEFAULT_SEED);
+
+  if (n_ctx > 0) {
+    size_t reserve = 0;
+    if (max_new_tokens_requested > 0 && n_ctx > 1) {
+      reserve = std::min(static_cast<size_t>(max_new_tokens_requested), static_cast<size_t>(n_ctx - 1));
+    }
+    size_t keep = static_cast<size_t>(n_ctx);
+    if (reserve > 0) {
+      keep = static_cast<size_t>(n_ctx) - reserve;
+    }
+    if (keep >= static_cast<size_t>(n_ctx)) keep = static_cast<size_t>(n_ctx > 1 ? n_ctx - 1 : 0);
+    if (keep == 0 && !prompt_tokens.empty()) keep = 1;
     if (keep == 0) {
       if (err) *err = "llama_cpp: prompt too long";
       return false;
     }
-    const size_t drop = prompt_tokens.size() - keep;
-    prompt_tokens.erase(prompt_tokens.begin(), prompt_tokens.begin() + static_cast<std::ptrdiff_t>(drop));
+    if (prompt_tokens.size() > keep) {
+      const size_t drop = prompt_tokens.size() - keep;
+      prompt_tokens.erase(prompt_tokens.begin(), prompt_tokens.begin() + static_cast<std::ptrdiff_t>(drop));
+    }
   }
 
+  int max_new_tokens = max_new_tokens_requested;
+  if (n_ctx > 0) {
+    const size_t used = prompt_tokens.size();
+    const size_t avail = used < static_cast<size_t>(n_ctx) ? static_cast<size_t>(n_ctx) - used : 0;
+    if (max_new_tokens < 0) max_new_tokens = 0;
+    max_new_tokens = std::min(max_new_tokens, static_cast<int>(avail));
+  }
+
+  auto sparams = llama_sampler_chain_default_params();
+  sparams.no_perf = true;
+  llama_sampler* sampler = llama_sampler_chain_init(sparams);
+  if (!sampler) {
+    if (err) *err = "llama_cpp: failed to init sampler";
+    return false;
+  }
+  llama_sampler_chain_add(sampler, llama_sampler_init_penalties(penalty_last_n, penalty_repeat, 0.0f, 0.0f));
+  if (temperature > 0.0f) {
+    llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
+  }
+  if (top_p > 0.0f && top_p < 1.0f) {
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
+  }
+  if (temperature <= 0.0f && !(top_p > 0.0f && top_p < 1.0f)) {
+    llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+  } else {
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(static_cast<uint32_t>(seed)));
+  }
+
+  if (penalty_last_n != 0 && !prompt_tokens.empty()) {
+    const size_t n_accept =
+        (penalty_last_n < 0) ? prompt_tokens.size() : std::min(prompt_tokens.size(), static_cast<size_t>(penalty_last_n));
+    for (size_t i = prompt_tokens.size() - n_accept; i < prompt_tokens.size(); i++) {
+      llama_sampler_accept(sampler, prompt_tokens[i]);
+    }
+  }
+
+  llama_batch last_batch{};
   const uint32_t n_batch_u = llama_n_batch(ctx_);
   const size_t n_batch = n_batch_u > 0 ? static_cast<size_t>(n_batch_u) : 512;
-  for (size_t start = 0; start < prompt_tokens.size();) {
-    const size_t chunk = std::min(n_batch, prompt_tokens.size() - start);
-    llama_batch batch = llama_batch_init(static_cast<int>(chunk), 0, 1);
-    for (size_t i = 0; i < chunk; i++) {
-      const size_t idx = start + i;
-      batch.token[i] = prompt_tokens[idx];
-      batch.pos[i] = static_cast<llama_pos>(idx);
-      batch.n_seq_id[i] = 1;
-      batch.seq_id[i][0] = 0;
-      batch.logits[i] = (idx + 1 == prompt_tokens.size());
+  if (llama_model_has_encoder(model_)) {
+    for (size_t start = 0; start < prompt_tokens.size();) {
+      const size_t chunk = std::min(n_batch, prompt_tokens.size() - start);
+      llama_batch batch = llama_batch_get_one(prompt_tokens.data() + start, static_cast<int32_t>(chunk));
+      batch.logits = nullptr;
+      const int32_t rc = llama_encode(ctx_, batch);
+      if (rc != 0) {
+        llama_sampler_free(sampler);
+        if (err) *err = "llama_cpp: encode failed (code " + std::to_string(rc) + ")";
+        return false;
+      }
+      start += chunk;
     }
-    batch.n_tokens = static_cast<int>(chunk);
-    if (llama_decode(ctx_, batch) != 0) {
-      llama_batch_free(batch);
-      if (err) *err = "llama_cpp: decode failed";
+
+    llama_token decoder_start_token_id = llama_model_decoder_start_token(model_);
+    if (decoder_start_token_id == LLAMA_TOKEN_NULL) decoder_start_token_id = llama_vocab_bos(vocab);
+    static thread_local std::vector<llama_token> token_buf(1);
+    token_buf[0] = decoder_start_token_id;
+    last_batch = llama_batch_get_one(token_buf.data(), 1);
+    last_batch.logits = nullptr;
+    const int32_t rc = llama_decode(ctx_, last_batch);
+    if (rc != 0) {
+      llama_sampler_free(sampler);
+      if (err) *err = "llama_cpp: decode failed (code " + std::to_string(rc) + ")";
       return false;
     }
-    llama_batch_free(batch);
-    start += chunk;
+  } else {
+    for (size_t start = 0; start < prompt_tokens.size();) {
+      const size_t chunk = std::min(n_batch, prompt_tokens.size() - start);
+      llama_batch batch = llama_batch_get_one(prompt_tokens.data() + start, static_cast<int32_t>(chunk));
+      batch.logits = nullptr;
+      const int32_t rc = llama_decode(ctx_, batch);
+      if (rc != 0) {
+        llama_sampler_free(sampler);
+        if (err) *err = "llama_cpp: decode failed (code " + std::to_string(rc) + ")";
+        return false;
+      }
+      last_batch = batch;
+      start += chunk;
+    }
   }
 
-  const int n_vocab = llama_vocab_n_tokens(vocab);
-  const llama_token eos = llama_vocab_eos(vocab);
-  llama_pos n_past = static_cast<llama_pos>(prompt_tokens.size());
-
-  const int max_new_tokens = 128;
   std::string out_acc;
+  std::vector<llama_token> gen_tokens;
+  gen_tokens.reserve(static_cast<size_t>(std::max(0, max_new_tokens)));
+  llama_token last_tok = LLAMA_TOKEN_NULL;
+  int last_tok_run = 0;
   for (int i = 0; i < max_new_tokens; i++) {
-    const float* logits = llama_get_logits(ctx_);
-    llama_token next = SampleGreedy(logits, n_vocab);
-    if (next == eos) break;
+    const int32_t sample_i = std::max<int32_t>(0, last_batch.n_tokens - 1);
+    llama_token next = llama_sampler_sample(sampler, ctx_, sample_i);
+    llama_sampler_accept(sampler, next);
+    if (llama_vocab_is_eog(vocab, next)) break;
+
+    gen_tokens.push_back(next);
+    if (next == last_tok) {
+      last_tok_run++;
+    } else {
+      last_tok = next;
+      last_tok_run = 1;
+    }
+    if (last_tok_run >= 32) break;
+    if (gen_tokens.size() >= 64) {
+      for (size_t w : {static_cast<size_t>(4), static_cast<size_t>(8), static_cast<size_t>(16), static_cast<size_t>(32)}) {
+        if (gen_tokens.size() < w * 2) continue;
+        const size_t a0 = gen_tokens.size() - w;
+        const size_t b0 = gen_tokens.size() - w * 2;
+        bool same = true;
+        for (size_t k = 0; k < w; k++) {
+          if (gen_tokens[b0 + k] != gen_tokens[a0 + k]) {
+            same = false;
+            break;
+          }
+        }
+        if (same) {
+          i = max_new_tokens;
+          break;
+        }
+      }
+    }
 
     auto piece = TokenToPiece(vocab, next);
     if (!piece.empty()) {
@@ -700,29 +865,44 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
       auto stop_at = [&](const std::string& s) -> bool {
         return !s.empty() && out_acc.size() >= s.size() && out_acc.compare(out_acc.size() - s.size(), s.size(), s) == 0;
       };
-      if (stop_at("\nUser:") || stop_at("\nUSER:")) {
+      if (stop_at("\nUser:") || stop_at("\nUSER:") || stop_at("\nAssistant:") || stop_at("\nASSISTANT:") || stop_at("USER:") ||
+          stop_at("ASSISTANT:")) {
         break;
       }
       on_delta(piece);
     }
 
-    llama_batch b = llama_batch_init(1, 0, 1);
-    b.token[0] = next;
-    b.pos[0] = n_past;
-    b.n_seq_id[0] = 1;
-    b.seq_id[0][0] = 0;
-    b.logits[0] = true;
-    b.n_tokens = 1;
-    n_past++;
-    if (llama_decode(ctx_, b) != 0) {
-      llama_batch_free(b);
-      if (err) *err = "llama_cpp: decode failed";
+    static thread_local std::vector<llama_token> next_token_buf(1);
+    next_token_buf[0] = next;
+    last_batch = llama_batch_get_one(next_token_buf.data(), 1);
+    last_batch.logits = nullptr;
+    if (n_ctx > 0) {
+      const size_t used = prompt_tokens.size() + gen_tokens.size();
+      if (used >= static_cast<size_t>(n_ctx)) break;
+    }
+    const int32_t rc = llama_decode(ctx_, last_batch);
+    if (rc != 0) {
+      llama_sampler_free(sampler);
+      if (err) *err = "llama_cpp: decode failed (code " + std::to_string(rc) + ")";
       return false;
     }
-    llama_batch_free(b);
   }
 
+  llama_sampler_free(sampler);
   on_done();
+
+  if (gen_cfg.unload_after_chat.has_value() && gen_cfg.unload_after_chat.value()) {
+    if (ctx_) {
+      llama_free(ctx_);
+      ctx_ = nullptr;
+    }
+    if (model_) {
+      llama_model_free(model_);
+      model_ = nullptr;
+    }
+    loaded_model_path_.clear();
+  }
+
   return true;
 }
 

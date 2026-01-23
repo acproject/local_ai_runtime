@@ -73,6 +73,42 @@ static nlohmann::json ParseJsonBody(const httplib::Request& req) {
   return nlohmann::json::parse(req.body, nullptr, false);
 }
 
+static std::string ExtractMessageContent(const nlohmann::json& content) {
+  if (content.is_string()) return content.get<std::string>();
+  if (content.is_object()) {
+    if (content.contains("type") && content["type"].is_string()) {
+      const auto type = content["type"].get<std::string>();
+      if (type == "text" || type == "input_text") {
+        if (content.contains("text") && content["text"].is_string()) return content["text"].get<std::string>();
+        if (content.contains("content") && content["content"].is_string()) return content["content"].get<std::string>();
+      }
+    }
+    if (content.contains("text") && content["text"].is_string()) return content["text"].get<std::string>();
+    if (content.contains("content") && content["content"].is_string()) return content["content"].get<std::string>();
+    if (content.contains("parts")) return ExtractMessageContent(content["parts"]);
+    return {};
+  }
+  if (!content.is_array()) return {};
+  std::string out;
+  for (const auto& part : content) {
+    if (!part.is_object()) continue;
+    if (part.contains("type") && part["type"].is_string()) {
+      const auto type = part["type"].get<std::string>();
+      if (type == "text" || type == "input_text") {
+        if (part.contains("text") && part["text"].is_string()) {
+          out += part["text"].get<std::string>();
+        } else if (part.contains("content") && part["content"].is_string()) {
+          out += part["content"].get<std::string>();
+        }
+        continue;
+      }
+      continue;
+    }
+    if (part.contains("text") && part["text"].is_string()) out += part["text"].get<std::string>();
+  }
+  return out;
+}
+
 static std::vector<ChatMessage> ParseChatMessages(const nlohmann::json& j, bool* ok) {
   std::vector<ChatMessage> out;
   *ok = false;
@@ -81,7 +117,7 @@ static std::vector<ChatMessage> ParseChatMessages(const nlohmann::json& j, bool*
     if (!m.is_object()) continue;
     ChatMessage cm;
     if (m.contains("role") && m["role"].is_string()) cm.role = m["role"].get<std::string>();
-    if (m.contains("content") && m["content"].is_string()) cm.content = m["content"].get<std::string>();
+    if (m.contains("content")) cm.content = ExtractMessageContent(m["content"]);
     if (!cm.role.empty()) out.push_back(std::move(cm));
   }
   *ok = true;
@@ -723,14 +759,31 @@ void OpenAiRouter::Register(httplib::Server* server) {
     auto req_messages = ParseChatMessages(j, &ok);
     if (!ok) return SendJson(&res, 400, MakeError("missing field: messages", "invalid_request_error"));
 
-    std::string session_id;
-    if (j.contains("session_id") && j["session_id"].is_string()) session_id = j["session_id"].get<std::string>();
-    session_id = sessions_->EnsureSessionId(session_id);
+    std::string preferred_session_id;
+    if (j.contains("session_id") && j["session_id"].is_string()) preferred_session_id = j["session_id"].get<std::string>();
+    if (preferred_session_id.empty()) {
+      preferred_session_id = req.get_header_value("x-session-id");
+      if (preferred_session_id.empty()) preferred_session_id = req.get_header_value("X-Session-Id");
+    }
+    const bool session_provided = !preferred_session_id.empty();
+    std::string session_id = sessions_->EnsureSessionId(preferred_session_id);
     res.set_header("x-session-id", session_id);
 
     bool use_server_history = false;
+    bool use_server_history_explicit = false;
     if (j.contains("use_server_history") && j["use_server_history"].is_boolean()) {
       use_server_history = j["use_server_history"].get<bool>();
+      use_server_history_explicit = true;
+    }
+    bool has_assistant = false;
+    for (const auto& m : req_messages) {
+      if (m.role == "assistant" || m.role == "tool") {
+        has_assistant = true;
+        break;
+      }
+    }
+    if (!use_server_history_explicit) {
+      use_server_history = session_provided && !has_assistant;
     }
 
     std::vector<ChatMessage> full_messages;
@@ -810,11 +863,11 @@ void OpenAiRouter::Register(httplib::Server* server) {
         if (model == "fake-tool") {
           loop.final_text = FakeModelOnce(full_messages);
         } else {
-          ChatRequest req;
-          req.model = provider_model;
-          req.stream = false;
-          req.messages = full_messages;
-          auto resp = provider->ChatOnce(req, &err);
+          ChatRequest creq;
+          creq.model = provider_model;
+          creq.stream = false;
+          creq.messages = full_messages;
+          auto resp = provider->ChatOnce(creq, &err);
           if (!resp) return SendJson(&res, 502, MakeError(err.empty() ? "upstream error" : err, "api_error"));
           loop.final_text = resp->content;
         }
@@ -877,11 +930,11 @@ void OpenAiRouter::Register(httplib::Server* server) {
       if (model == "fake-tool") {
         loop.final_text = FakeModelOnce(full_messages);
       } else {
-        ChatRequest req;
-        req.model = provider_model;
-        req.stream = false;
-        req.messages = full_messages;
-        auto resp = provider->ChatOnce(req, &err);
+        ChatRequest creq;
+        creq.model = provider_model;
+        creq.stream = false;
+        creq.messages = full_messages;
+        auto resp = provider->ChatOnce(creq, &err);
         if (resp) loop.final_text = resp->content;
       }
     }

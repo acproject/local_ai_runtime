@@ -5,6 +5,18 @@ $Env:PATH='D:\workspace\cpp_projects\local_ai_runtime\build-vs2022-x64\bin\Relea
 - 启动多个Provider
 ```ps
 $Env:PATH='D:\workspace\cpp_projects\local_ai_runtime\build-vs2022-x64\bin\Release;' + $Env:PATH;$Env:RUNTIME_LISTEN_HOST='127.0.0.1';$Env:RUNTIME_LISTEN_PORT='18081';$Env:RUNTIME_PROVIDER='llama_cpp';$Env:LLAMA_CPP_MODEL='M:\llm_models';$Env:OLLAMA_HOST='http://127.0.0.1:11434';$Env:LMDEPLOY_HOST='http://127.0.0.1:23333';$Env:NO_PROXY='127.0.0.1,localhost';$Env:no_proxy='127.0.0.1,localhost';& 'D:\workspace\cpp_projects\local_ai_runtime\build-vs2022-x64\Release\local-ai-runtime.exe'
+
+## 支持cuda可以使用下面的内容：
+$Env:PATH=' D:\workspace\cpp_projects\local_ai_runtime\build-vs2022-x64-cuda\bin\Release;' + $Env:PATH;$Env:RUNTIME_LISTEN_HOST='127.0.0.1';$Env:RUNTIME_LISTEN_PORT='18081';$Env:RUNTIME_PROVIDER='llama_cpp';$Env:LLAMA_CPP_MODEL='M:\llm_models';$Env:OLLAMA_HOST='http://127.0.0.1:11434';$Env:LMDEPLOY_HOST='http://127.0.0.1:23333';$Env:NO_PROXY='127.0.0.1,localhost';$Env:no_proxy='127.0.0.1,localhost';& ' D:\workspace\cpp_projects\local_ai_runtime\build-vs2022-x64-cuda\bin\Release\local-ai-runtime.exe'
+```
+* 注意$Env:RUNTIME_LISTEN_PORT='18080'一定要和CloudToLocal中本地的local_agent.exe中，参数--openai=http://127.0.0.1:18080，端口一致
+
+* 注意如果使用本地服务，还需要下面的设置：
+```ps
+PowerShell 里加这些环境变量（会覆盖默认）：
+- $env:LLAMA_CPP_FLASH_ATTN="disabled"
+- $env:LLAMA_CPP_N_BATCH="256"
+- $env:LLAMA_CPP_N_UBATCH="128"
 ```
 
 ### API的使用方式

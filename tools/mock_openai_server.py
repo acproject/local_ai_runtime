@@ -149,7 +149,7 @@ class Handler(BaseHTTPRequestHandler):
                         last = messages[-1]
                         if isinstance(last, dict):
                             msg = str(last.get("content") or "")
-                    content = f"mock:{msg}"
+                    content = f"mock:n={len(messages)} last={msg}"
 
                 self._send(
                     200,
