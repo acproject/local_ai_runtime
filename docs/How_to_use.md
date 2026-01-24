@@ -21,7 +21,8 @@ PowerShell 里加这些环境变量（会覆盖默认）：
 
 ### 编译
 LOCAL_AI_RUNTIME_WITH_LLAMA_CPP=ON
-cmake --build build-vs2022-x64-cuda --config 
+cmake -S . -B build-vs2022-x64-cuda -DLOCAL_AI_RUNTIME_WITH_LLAMA_CPP=ON
+cmake --build build-vs2022-x64-cuda --config Release
 
 ### API的使用方式
 
