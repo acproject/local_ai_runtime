@@ -3,6 +3,7 @@
 #include "providers/provider.hpp"
 
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -30,6 +31,31 @@ class ProviderRegistry {
 
   void SetDefaultProviderName(std::string name) {
     default_provider_ = std::move(name);
+  }
+
+  struct SwitchResult {
+    bool switched = false;
+    std::string from;
+    std::string to;
+  };
+
+  SwitchResult Activate(const std::string& name) {
+    std::lock_guard<std::mutex> lock(mu_);
+    SwitchResult out;
+    if (name.empty()) return out;
+    if (active_provider_ == name) return out;
+    auto it = providers_.find(name);
+    if (it == providers_.end()) return out;
+    if (!active_provider_.empty()) {
+      auto prev_it = providers_.find(active_provider_);
+      if (prev_it != providers_.end() && prev_it->second) prev_it->second->Stop();
+    }
+    if (it->second) it->second->Start();
+    out.switched = true;
+    out.from = active_provider_;
+    out.to = name;
+    active_provider_ = name;
+    return out;
   }
 
   std::vector<IProvider*> List() const {
@@ -65,7 +91,9 @@ class ProviderRegistry {
   }
 
  private:
+  mutable std::mutex mu_;
   std::string default_provider_;
+  std::string active_provider_;
   std::unordered_map<std::string, std::unique_ptr<IProvider>> providers_;
 };
 

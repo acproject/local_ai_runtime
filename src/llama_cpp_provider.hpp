@@ -18,6 +18,9 @@ class LlamaCppProvider : public IProvider {
   explicit LlamaCppProvider(std::string model_path);
   ~LlamaCppProvider() override;
 
+  void Start() override;
+  void Stop() override;
+
   std::string Name() const override;
   std::vector<ModelInfo> ListModels(std::string* err) override;
   std::optional<std::vector<double>> Embeddings(const std::string& model, const std::string& input, std::string* err) override;

@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <iostream>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -71,6 +72,53 @@ static std::string SseDone() {
 
 static nlohmann::json ParseJsonBody(const httplib::Request& req) {
   return nlohmann::json::parse(req.body, nullptr, false);
+}
+
+static std::string RedactHeaderValue(const std::string& key, const std::string& value) {
+  const auto k = ToLowerAscii(key);
+  if (k == "authorization" || k == "proxy-authorization" || k == "api-key" || k == "api_key" || k == "x-api-key") {
+    return "<redacted>";
+  }
+  return value;
+}
+
+static std::string SanitizeBodyForLog(const std::string& body) {
+  if (body.empty()) return {};
+  auto j = nlohmann::json::parse(body, nullptr, false);
+  if (j.is_discarded()) return body;
+  if (j.is_object()) {
+    for (const auto& key : {"api_key", "api-key", "authorization", "apiKey"}) {
+      if (j.contains(key)) j.erase(key);
+    }
+    if (j.contains("headers") && j["headers"].is_object()) {
+      auto& h = j["headers"];
+      for (const auto& key : {"authorization", "proxy-authorization", "api-key", "api_key", "x-api-key"}) {
+        if (h.contains(key)) h.erase(key);
+      }
+    }
+  }
+  return j.dump();
+}
+
+static void LogRequestRaw(const httplib::Request& req) {
+  std::cout << "[request] " << req.method << " " << req.path << "\n";
+  for (const auto& it : req.headers) {
+    std::cout << "  " << it.first << ": " << RedactHeaderValue(it.first, it.second) << "\n";
+  }
+  if (!req.body.empty()) {
+    std::cout << "  body: " << SanitizeBodyForLog(req.body) << "\n";
+  }
+}
+
+static void LogProviderUse(const std::string& provider_name, const std::string& model) {
+  std::cout << "[provider] " << provider_name << " model=" << model << "\n";
+}
+
+static void LogClientMessage(const std::string& session_id, const std::vector<ChatMessage>& messages) {
+  std::cout << "[client-message] session_id=" << session_id << "\n";
+  for (const auto& m : messages) {
+    std::cout << "  " << m.role << ": " << m.content << "\n";
+  }
 }
 
 static std::string ExtractMessageContent(const nlohmann::json& content) {
@@ -712,6 +760,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
   };
 
   auto embeddings_handler = [&](const httplib::Request& req, httplib::Response& res) {
+    LogRequestRaw(req);
     auto j = ParseJsonBody(req);
     if (j.is_discarded()) return SendJson(&res, 400, MakeError("invalid json body", "invalid_request_error"));
     if (!j.contains("model") || !j["model"].is_string()) {
@@ -731,6 +780,13 @@ void OpenAiRouter::Register(httplib::Server* server) {
     std::string err;
     auto resolved = providers_ ? providers_->Resolve(model) : std::nullopt;
     if (!resolved) return SendJson(&res, 400, MakeError("unknown provider in model", "invalid_request_error"));
+    if (providers_) {
+      auto sw = providers_->Activate(resolved->provider_name);
+      if (sw.switched) {
+        std::cout << "[provider-switch] from=" << sw.from << " to=" << sw.to << "\n";
+      }
+    }
+    LogProviderUse(resolved->provider_name, resolved->model);
     auto vec = resolved->provider->Embeddings(resolved->model, input, &err);
     if (!vec) return SendJson(&res, 502, MakeError(err.empty() ? "upstream error" : err, "api_error"));
 
@@ -748,6 +804,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
   };
 
   auto chat_completions_handler = [&](const httplib::Request& req, httplib::Response& res) {
+    LogRequestRaw(req);
     auto j = ParseJsonBody(req);
     if (j.is_discarded()) return SendJson(&res, 400, MakeError("invalid json body", "invalid_request_error"));
     if (!j.contains("model") || !j["model"].is_string()) {
@@ -767,6 +824,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
     }
     std::string session_id = sessions_->EnsureSessionId(preferred_session_id);
     res.set_header("x-session-id", session_id);
+    LogClientMessage(session_id, req_messages);
 
     bool use_server_history = false;
     bool use_server_history_explicit = false;
@@ -841,6 +899,13 @@ void OpenAiRouter::Register(httplib::Server* server) {
       if (!resolved) return SendJson(&res, 400, MakeError("unknown provider in model", "invalid_request_error"));
       provider = resolved->provider;
       provider_model = resolved->model;
+      if (providers_) {
+        auto sw = providers_->Activate(resolved->provider_name);
+        if (sw.switched) {
+          std::cout << "[provider-switch] from=" << sw.from << " to=" << sw.to << "\n";
+        }
+      }
+      LogProviderUse(resolved->provider_name, resolved->model);
     }
 
     if (!stream) {
@@ -912,6 +977,91 @@ void OpenAiRouter::Register(httplib::Server* server) {
     auto id = NewId("chatcmpl");
     auto created = NowSeconds();
 
+    if (allowed_tools.empty() && model != "fake-tool") {
+      ChatRequest creq;
+      creq.model = provider_model;
+      creq.stream = true;
+      creq.messages = full_messages;
+
+      res.set_chunked_content_provider(
+          "text/event-stream",
+          [=,
+           this,
+           turn = std::move(turn),
+           creq = std::move(creq)](size_t, httplib::DataSink& sink) mutable {
+            try {
+              std::string acc;
+              bool wrote_role = false;
+              bool write_ok = true;
+
+              auto write_bytes = [&](const std::string& s) -> bool {
+                if (sink.is_writable && !sink.is_writable()) return false;
+                if (!sink.write) return false;
+                return sink.write(s.data(), s.size());
+              };
+
+              auto write_chunk = [&](const nlohmann::json& delta, const nlohmann::json& finish_reason) -> bool {
+                nlohmann::json chunk;
+                chunk["id"] = id;
+                chunk["object"] = "chat.completion.chunk";
+                chunk["created"] = created;
+                chunk["model"] = model;
+                nlohmann::json choice;
+                choice["index"] = 0;
+                choice["delta"] = delta;
+                choice["finish_reason"] = finish_reason;
+                chunk["choices"] = nlohmann::json::array({choice});
+                return write_bytes(SseData(chunk));
+              };
+
+              std::string stream_err;
+              const bool ok = provider->ChatStream(
+                  creq,
+                  [&](const std::string& delta_text) {
+                    if (!write_ok) return;
+                    nlohmann::json delta;
+                    if (!wrote_role) {
+                      delta["role"] = "assistant";
+                      wrote_role = true;
+                    }
+                    delta["content"] = delta_text;
+                    if (!write_chunk(delta, nullptr)) {
+                      write_ok = false;
+                      return;
+                    }
+                    acc += delta_text;
+                  },
+                  []() {},
+                  &stream_err);
+
+              if (!ok && !stream_err.empty()) {
+                std::cout << "[provider-error] " << stream_err << "\n";
+              }
+              if (write_ok) {
+                write_ok = write_chunk(nlohmann::json::object(), "stop");
+              }
+
+              if (write_ok) {
+                turn.output_text = acc;
+                sessions_->AppendTurn(session_id, turn);
+                if (use_server_history) {
+                  sessions_->AppendToHistory(session_id, turn.input_messages);
+                  sessions_->AppendToHistory(session_id, {ChatMessage{"assistant", acc}});
+                }
+              }
+
+              if (write_ok) write_bytes(SseDone());
+              sink.done();
+              return write_ok;
+            } catch (...) {
+              sink.done();
+              return false;
+            }
+          },
+          [](bool) {});
+      return;
+    }
+
     std::string err;
     ToolLoopResult loop;
     if (!allowed_tools.empty()) {
@@ -926,16 +1076,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
         loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_steps, max_tool_calls, &err);
       }
     } else {
-      if (model == "fake-tool") {
-        loop.final_text = FakeModelOnce(full_messages);
-      } else {
-        ChatRequest creq;
-        creq.model = provider_model;
-        creq.stream = false;
-        creq.messages = full_messages;
-        auto resp = provider->ChatOnce(creq, &err);
-        if (resp) loop.final_text = resp->content;
-      }
+      loop.final_text = FakeModelOnce(full_messages);
     }
 
     if (!err.empty() && loop.final_text.empty()) {
@@ -1050,6 +1191,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
   };
 
   auto responses_handler = [&](const httplib::Request& req, httplib::Response& res) {
+    LogRequestRaw(req);
     auto j = ParseJsonBody(req);
     if (j.is_discarded()) return SendJson(&res, 400, MakeError("invalid json body", "invalid_request_error"));
     if (!j.contains("model") || !j["model"].is_string()) {
@@ -1075,6 +1217,13 @@ void OpenAiRouter::Register(httplib::Server* server) {
     } else {
       auto resolved = providers_ ? providers_->Resolve(model) : std::nullopt;
       if (!resolved) return SendJson(&res, 400, MakeError("unknown provider in model", "invalid_request_error"));
+      if (providers_) {
+        auto sw = providers_->Activate(resolved->provider_name);
+        if (sw.switched) {
+          std::cout << "[provider-switch] from=" << sw.from << " to=" << sw.to << "\n";
+        }
+      }
+      LogProviderUse(resolved->provider_name, resolved->model);
       ChatRequest creq;
       creq.model = resolved->model;
       creq.stream = false;

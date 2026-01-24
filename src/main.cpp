@@ -14,6 +14,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <unordered_map>
 #include <string>
@@ -28,6 +29,18 @@ int main() {
   if (cfg.mnn_enabled) providers.Register(std::make_unique<runtime::OpenAiCompatibleHttpProvider>("mnn", cfg.mnn));
   if (cfg.lmdeploy_enabled) providers.Register(std::make_unique<runtime::OpenAiCompatibleHttpProvider>("lmdeploy", cfg.lmdeploy));
   runtime::OpenAiRouter router(&sessions, &providers, runtime::BuildDefaultToolRegistry());
+
+  std::cout << "[runtime] default_provider=" << cfg.default_provider << "\n";
+  std::cout << "[provider] llama_cpp model_path=" << (cfg.llama_cpp_model_path.empty() ? "<empty>" : cfg.llama_cpp_model_path)
+            << "\n";
+  std::cout << "[provider] ollama endpoint=" << cfg.ollama.scheme << "://" << cfg.ollama.host << ":" << cfg.ollama.port
+            << cfg.ollama.base_path << "\n";
+  std::cout << "[provider] mnn enabled=" << (cfg.mnn_enabled ? "true" : "false") << " endpoint=" << cfg.mnn.scheme << "://"
+            << cfg.mnn.host << ":" << cfg.mnn.port << cfg.mnn.base_path << "\n";
+  std::cout << "[provider] lmdeploy enabled=" << (cfg.lmdeploy_enabled ? "true" : "false") << " endpoint="
+            << cfg.lmdeploy.scheme << "://" << cfg.lmdeploy.host << ":" << cfg.lmdeploy.port << cfg.lmdeploy.base_path << "\n";
+  std::cout << "[provider] mcp enabled=" << (cfg.mcp_enabled ? "true" : "false") << " endpoint=" << cfg.mcp.scheme << "://"
+            << cfg.mcp.host << ":" << cfg.mcp.port << cfg.mcp.base_path << "\n";
 
   httplib::Server server;
   router.Register(&server);

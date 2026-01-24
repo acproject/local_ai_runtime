@@ -348,6 +348,24 @@ LlamaCppProvider::~LlamaCppProvider() {
   }
 }
 
+void LlamaCppProvider::Start() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (model_ids_.empty()) BuildModelIndex();
+}
+
+void LlamaCppProvider::Stop() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (ctx_) {
+    llama_free(ctx_);
+    ctx_ = nullptr;
+  }
+  if (model_) {
+    llama_model_free(model_);
+    model_ = nullptr;
+  }
+  loaded_model_path_.clear();
+}
+
 std::string LlamaCppProvider::Name() const {
   return "llama_cpp";
 }

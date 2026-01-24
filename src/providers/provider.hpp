@@ -30,6 +30,9 @@ class IProvider {
  public:
   virtual ~IProvider() = default;
 
+  virtual void Start() {}
+  virtual void Stop() {}
+
   virtual std::string Name() const = 0;
   virtual std::vector<ModelInfo> ListModels(std::string* err) = 0;
   virtual std::optional<std::vector<double>> Embeddings(const std::string& model,
