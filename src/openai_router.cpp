@@ -1,4 +1,5 @@
 #include "openai_router.hpp"
+#include "ollama_provider.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -737,11 +738,23 @@ void OpenAiRouter::Register(httplib::Server* server) {
     nlohmann::json out;
     out["object"] = "list";
     out["data"] = nlohmann::json::array();
+    nlohmann::json provider_status = nlohmann::json::object();
     const std::string default_provider = providers_ ? providers_->DefaultProviderName() : "";
     if (providers_) {
       for (auto* p : providers_->List()) {
         std::string err;
         auto models = p->ListModels(&err);
+        if (p->Name() == "ollama") {
+          if (auto* op = dynamic_cast<OllamaProvider*>(p)) {
+            std::string ps_err;
+            auto ps = op->GetPs(&ps_err);
+            if (ps) {
+              provider_status["ollama"] = {{"ps", *ps}};
+            } else if (!ps_err.empty()) {
+              provider_status["ollama"] = {{"ps_error", ps_err}};
+            }
+          }
+        }
         for (const auto& m : models) {
           nlohmann::json item;
           if (p->Name() == default_provider) {
@@ -755,6 +768,9 @@ void OpenAiRouter::Register(httplib::Server* server) {
           out["data"].push_back(std::move(item));
         }
       }
+    }
+    if (!provider_status.empty()) {
+      out["provider_status"] = std::move(provider_status);
     }
     SendJson(&res, 200, out);
   };

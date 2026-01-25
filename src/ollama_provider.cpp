@@ -65,6 +65,25 @@ void OllamaProvider::Stop() {
   LogPs(*cli, endpoint_, "stop");
 }
 
+std::optional<nlohmann::json> OllamaProvider::GetPs(std::string* err) {
+  auto cli = MakeClient(endpoint_);
+  auto res = cli->Get(JoinPath(endpoint_.base_path, "/api/ps"));
+  if (!res) {
+    if (err) *err = "ollama: /api/ps connect failed";
+    return std::nullopt;
+  }
+  if (res->status < 200 || res->status >= 300) {
+    if (err) *err = "ollama: /api/ps http " + std::to_string(res->status);
+    return std::nullopt;
+  }
+  auto j = nlohmann::json::parse(res->body, nullptr, false);
+  if (j.is_discarded()) {
+    if (err) *err = "ollama: invalid json from /api/ps";
+    return std::nullopt;
+  }
+  return j;
+}
+
 std::string OllamaProvider::Name() const {
   return "ollama";
 }

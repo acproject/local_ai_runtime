@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "providers/provider.hpp"
 
+#include <nlohmann/json.hpp>
 #include <mutex>
 
 namespace runtime {
@@ -13,6 +14,7 @@ class OllamaProvider : public IProvider {
 
   void Start() override;
   void Stop() override;
+  std::optional<nlohmann::json> GetPs(std::string* err);
 
   std::string Name() const override;
   std::vector<ModelInfo> ListModels(std::string* err) override;
