@@ -3,6 +3,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <iostream>
 #include <string>
 
 namespace runtime {
@@ -23,9 +24,46 @@ static std::string JoinPath(const std::string& base, const std::string& path) {
   return base + path;
 }
 
+static void LogPs(httplib::Client& cli, const HttpEndpoint& endpoint, const std::string& tag) {
+  auto res = cli.Get(JoinPath(endpoint.base_path, "/api/ps"));
+  if (!res) {
+    std::cout << "[ollama] " << tag << " ps=failed\n";
+    return;
+  }
+  std::cout << "[ollama] " << tag << " ps_status=" << res->status << " body=" << res->body << "\n";
+}
+
 }  // namespace
 
 OllamaProvider::OllamaProvider(HttpEndpoint endpoint) : endpoint_(std::move(endpoint)) {}
+
+void OllamaProvider::Start() {
+  auto cli = MakeClient(endpoint_);
+  LogPs(*cli, endpoint_, "start");
+}
+
+void OllamaProvider::Stop() {
+  std::string model;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    model = last_model_;
+    last_model_.clear();
+  }
+  if (model.empty()) return;
+  auto cli = MakeClient(endpoint_);
+  nlohmann::json j;
+  j["model"] = model;
+  j["prompt"] = "";
+  j["stream"] = false;
+  j["keep_alive"] = 0;
+  auto res = cli->Post(JoinPath(endpoint_.base_path, "/api/generate"), j.dump(), "application/json");
+  if (!res) {
+    std::cout << "[ollama] unload failed model=" << model << "\n";
+    return;
+  }
+  std::cout << "[ollama] unload model=" << model << " status=" << res->status << "\n";
+  LogPs(*cli, endpoint_, "stop");
+}
 
 std::string OllamaProvider::Name() const {
   return "ollama";
@@ -63,6 +101,10 @@ std::vector<ModelInfo> OllamaProvider::ListModels(std::string* err) {
 std::optional<std::vector<double>> OllamaProvider::Embeddings(const std::string& model,
                                                               const std::string& input,
                                                               std::string* err) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    last_model_ = model;
+  }
   auto cli = MakeClient(endpoint_);
   nlohmann::json j;
   j["model"] = model;
@@ -90,6 +132,10 @@ std::optional<std::vector<double>> OllamaProvider::Embeddings(const std::string&
 }
 
 std::optional<ChatResponse> OllamaProvider::ChatOnce(const ChatRequest& req, std::string* err) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    last_model_ = req.model;
+  }
   auto cli = MakeClient(endpoint_);
   nlohmann::json j;
   j["model"] = req.model;

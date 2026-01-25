@@ -3,11 +3,16 @@
 #include "config.hpp"
 #include "providers/provider.hpp"
 
+#include <mutex>
+
 namespace runtime {
 
 class OllamaProvider : public IProvider {
  public:
   explicit OllamaProvider(HttpEndpoint endpoint);
+
+  void Start() override;
+  void Stop() override;
 
   std::string Name() const override;
   std::vector<ModelInfo> ListModels(std::string* err) override;
@@ -21,6 +26,8 @@ class OllamaProvider : public IProvider {
 
  private:
   HttpEndpoint endpoint_;
+  std::mutex mu_;
+  std::string last_model_;
 };
 
 }  // namespace runtime
