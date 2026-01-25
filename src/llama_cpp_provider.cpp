@@ -548,10 +548,13 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
     return nullptr;
   };
 
-  auto try_load_with = [&](const llama_model_kv_override* overrides) -> llama_model* {
+  auto try_load_with = [&](const llama_model_kv_override* overrides,
+                           const std::optional<int32_t>& gpu_layers_override) -> llama_model* {
     llama_model_params p = llama_model_default_params();
     p.kv_overrides = overrides;
-    if (cfg.n_gpu_layers != 0) p.n_gpu_layers = cfg.n_gpu_layers;
+    int32_t n_gpu_layers = cfg.n_gpu_layers;
+    if (gpu_layers_override.has_value()) n_gpu_layers = gpu_layers_override.value();
+    if (n_gpu_layers != 0) p.n_gpu_layers = n_gpu_layers;
     if (cfg.split_mode.has_value()) p.split_mode = cfg.split_mode.value();
     if (cfg.main_gpu.has_value()) p.main_gpu = cfg.main_gpu.value();
     p.use_mmap = true;
@@ -568,7 +571,7 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
   const llama_model_kv_override* overrides = nullptr;
 
   for (int attempt = 0; attempt < 4 && !model_; attempt++) {
-    model_ = try_load_with(overrides);
+    model_ = try_load_with(overrides, std::nullopt);
     if (model_) break;
 
     force_yarn = force_yarn || RecentLlamaLogsContain("deepseek2.rope.scaling.yarn_log_multiplier");
@@ -578,6 +581,15 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
     const auto* next_overrides = pick_overrides(force_yarn, force_glm4_pre);
     if (next_overrides == overrides) break;
     overrides = next_overrides;
+  }
+  if (!model_) {
+    const bool cuda_oom = RecentLlamaLogsContain("cudaMalloc failed") ||
+                          RecentLlamaLogsContain("unable to allocate CUDA") ||
+                          RecentLlamaLogsContain("CUDA out of memory");
+    if (cuda_oom && cfg.n_gpu_layers != 0) {
+      std::cout << "[provider] llama_cpp cuda oom, fallback to cpu\n";
+      model_ = try_load_with(overrides, 0);
+    }
   }
   if (!model_) {
     if (err) {
