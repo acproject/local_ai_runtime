@@ -18,6 +18,38 @@ PowerShell 里加这些环境变量（会覆盖默认）：
 - $env:LLAMA_CPP_N_BATCH="256"
 - $env:LLAMA_CPP_N_UBATCH="128"
 ```
+* 轻量GPU辅助（CPU为主，GPU为辅）建议：
+```ps
+PowerShell 里加这些环境变量（会覆盖默认）：
+- $env:LLAMA_CPP_N_GPU_LAYERS="8"
+- $env:LLAMA_CPP_OFFLOAD_KQV="0"
+- $env:LLAMA_CPP_N_BATCH="128"
+- $env:LLAMA_CPP_N_UBATCH="64"
+```
+* 说明：
+  - LLAMA_CPP_N_GPU_LAYERS 数值越大，占用显存越多；显存不足时请调小（如 8/4/0）
+  - LLAMA_CPP_OFFLOAD_KQV=0 表示不额外把 K/Q/V 缓冲放到 GPU，可进一步降低显存占用
+- 完整的使用方法
+```ps
+$env:PATH='D:\workspace\cpp_projects\local_ai_runtime\build-vs2022-x64-cuda\bin\Release;' + $env:PATH; `
+$env:RUNTIME_LISTEN_HOST='127.0.0.1'; `
+$env:RUNTIME_LISTEN_PORT='18081'; `
+$env:RUNTIME_PROVIDER='llama_cpp'; `
+$env:LLAMA_CPP_MODEL='M:\llm_models'; `
+$env:NO_PROXY='127.0.0.1,localhost'; `
+$env:no_proxy='127.0.0.1,localhost'; `
+$env:LLAMA_CPP_N_CTX=8192; `
+$env:LLAMA_CPP_MAX_NEW_TOKENS=512; `
+$env:LLAMA_CPP_FLASH_ATTN='disabled'; `
+$env:LLAMA_CPP_N_BATCH='128'; `
+$env:LLAMA_CPP_N_UBATCH='64'; `
+$env:LLAMA_CPP_TEMPERATURE='0.7'; `
+$env:LLAMA_CPP_TOP_P='0.9'; `
+$env:LLAMA_CPP_SEED='42'; `
+$env:LLAMA_CPP_N_GPU_LAYERS='8'; `
+$env:LLAMA_CPP_OFFLOAD_KQV='0'; `
+& 'D:\workspace\cpp_projects\local_ai_runtime\build-vs2022-x64-cuda\bin\Release\local-ai-runtime.exe'
+```
 
 ### 编译
 LOCAL_AI_RUNTIME_WITH_LLAMA_CPP=ON
