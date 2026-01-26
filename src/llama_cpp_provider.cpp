@@ -742,7 +742,7 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
 
   const uint32_t n_ctx = llama_n_ctx(ctx_);
   const auto gen_cfg = LoadLlamaRuntimeConfigFromEnv();
-  const int max_new_tokens_requested = gen_cfg.max_new_tokens.has_value() ? gen_cfg.max_new_tokens.value() : 128;
+  const int max_new_tokens_requested = gen_cfg.max_new_tokens.has_value() ? gen_cfg.max_new_tokens.value() : 512;
   const int penalty_last_n = gen_cfg.penalty_last_n.has_value() ? gen_cfg.penalty_last_n.value() : 64;
   const float penalty_repeat = gen_cfg.penalty_repeat.has_value() ? gen_cfg.penalty_repeat.value() : 1.1f;
   const float temperature = gen_cfg.temperature.has_value() ? gen_cfg.temperature.value() : 0.0f;

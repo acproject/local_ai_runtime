@@ -20,6 +20,7 @@
 #include <string>
 
 int main() {
+  std::cout.setf(std::ios::unitbuf);
   auto cfg = runtime::LoadConfigFromEnv();
 
   runtime::SessionStoreConfig store_cfg;
