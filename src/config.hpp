@@ -27,6 +27,7 @@ struct RuntimeConfig {
   HttpEndpoint session_store_endpoint;
   std::string session_store_password;
   int session_store_db = 0;
+  std::string session_store_namespace;
   HttpEndpoint ollama;
   HttpEndpoint mnn;
   HttpEndpoint lmdeploy;

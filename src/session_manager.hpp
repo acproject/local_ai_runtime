@@ -34,6 +34,7 @@ struct SessionStoreConfig {
   HttpEndpoint endpoint;
   std::string password;
   int db = 0;
+  std::string store_namespace;
 };
 
 class SessionStore;

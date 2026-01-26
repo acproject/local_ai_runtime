@@ -102,6 +102,7 @@ RuntimeConfig LoadConfigFromEnv() {
   }
   if (auto spw = GetEnvStr("RUNTIME_SESSION_STORE_PASSWORD"); !spw.empty()) cfg.session_store_password = spw;
   if (auto sdb = GetEnvStr("RUNTIME_SESSION_STORE_DB"); !sdb.empty()) cfg.session_store_db = std::atoi(sdb.c_str());
+  if (auto sns = GetEnvStr("RUNTIME_SESSION_STORE_NAMESPACE"); !sns.empty()) cfg.session_store_namespace = sns;
 
   auto ollama = GetEnvStr("OLLAMA_HOST");
   if (!ollama.empty()) cfg.ollama = ParseHttpEndpoint(ollama, 11434);

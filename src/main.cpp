@@ -29,6 +29,7 @@ int main() {
   store_cfg.endpoint = cfg.session_store_endpoint;
   store_cfg.password = cfg.session_store_password;
   store_cfg.db = cfg.session_store_db;
+  store_cfg.store_namespace = cfg.session_store_namespace;
   runtime::SessionManager sessions(store_cfg);
   runtime::ProviderRegistry providers(cfg.default_provider);
   providers.Register(std::make_unique<runtime::LlamaCppProvider>(cfg.llama_cpp_model_path));

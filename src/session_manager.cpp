@@ -46,20 +46,41 @@ class SessionStore {
 namespace {
 class FileSessionStore : public SessionStore {
  public:
-  explicit FileSessionStore(std::string path) : path_(std::move(path)) { LoadAll(); }
+  FileSessionStore(std::string path, std::string store_namespace)
+      : path_(std::move(path)), store_namespace_(std::move(store_namespace)) {
+    LoadAll();
+  }
   std::optional<Session> Load(const std::string& session_id) override {
-    auto it = map_.find(session_id);
+    auto it = map_.find(MakeKey(session_id));
     if (it == map_.end()) return std::nullopt;
     return it->second;
   }
   void Save(const Session& s) override {
-    map_[s.session_id] = s;
+    map_[MakeKey(s.session_id)] = s;
     PersistAll();
   }
 
  private:
   std::string path_;
+  std::string store_namespace_;
   std::unordered_map<std::string, Session> map_;
+
+  std::string MakeKey(const std::string& session_id) const {
+    if (store_namespace_.empty()) return session_id;
+    return store_namespace_ + ":" + session_id;
+  }
+
+  bool KeyMatchesNamespace(const std::string& key) const {
+    if (store_namespace_.empty()) return true;
+    if (key.size() <= store_namespace_.size()) return false;
+    if (key.rfind(store_namespace_, 0) != 0) return false;
+    return key[store_namespace_.size()] == ':';
+  }
+
+  std::string StripNamespace(const std::string& key) const {
+    if (!KeyMatchesNamespace(key)) return key;
+    return key.substr(store_namespace_.size() + 1);
+  }
 
   void LoadAll() {
     std::filesystem::path p(path_);
@@ -76,10 +97,14 @@ class FileSessionStore : public SessionStore {
     if (!j.is_object() || !j.contains("sessions") || !j["sessions"].is_object()) return;
     for (auto it = j["sessions"].begin(); it != j["sessions"].end(); ++it) {
       if (!it.key().empty() && it.value().is_object()) {
+        if (!KeyMatchesNamespace(it.key())) continue;
         Session s;
-        s.session_id = it.key();
+        s.session_id = StripNamespace(it.key());
         const auto& sj = it.value();
-        if (sj.contains("session_id") && sj["session_id"].is_string()) s.session_id = sj["session_id"].get<std::string>();
+        if (sj.contains("session_id") && sj["session_id"].is_string()) {
+          auto sid = sj["session_id"].get<std::string>();
+          if (!sid.empty()) s.session_id = sid;
+        }
         if (sj.contains("history") && sj["history"].is_array()) {
           for (const auto& m : sj["history"]) {
             if (m.is_object() && m.contains("role") && m["role"].is_string() && m.contains("content")) {
@@ -110,7 +135,7 @@ class FileSessionStore : public SessionStore {
             s.turns.push_back(std::move(tr));
           }
         }
-        map_.emplace(s.session_id, std::move(s));
+        map_.emplace(it.key(), std::move(s));
       }
     }
   }
@@ -162,12 +187,13 @@ class FileSessionStore : public SessionStore {
 
 class MiniMemoryStore : public SessionStore {
  public:
-  MiniMemoryStore(const HttpEndpoint& ep, const std::string& password, int db) : ep_(ep), password_(password), db_(db) {}
+  MiniMemoryStore(const HttpEndpoint& ep, const std::string& password, int db, std::string store_namespace)
+      : ep_(ep), password_(password), db_(db), store_namespace_(std::move(store_namespace)) {}
   std::optional<Session> Load(const std::string& session_id) override {
     auto conn = Connect();
     if (!conn) return std::nullopt;
     if (!AuthAndSelect(*conn)) return std::nullopt;
-    auto val = SendGet(*conn, "session:" + session_id);
+    auto val = SendGet(*conn, MakeKey(session_id));
     Close(*conn);
     if (!val.has_value()) return std::nullopt;
     nlohmann::json j = nlohmann::json::parse(*val, nullptr, false);
@@ -224,7 +250,7 @@ class MiniMemoryStore : public SessionStore {
       if (t.output_text.has_value()) tj["output_text"] = *t.output_text; else tj["output_text"] = nullptr;
       j["turns"].push_back(std::move(tj));
     }
-    auto ok = SendSet(*conn, "session:" + s.session_id, j.dump());
+    auto ok = SendSet(*conn, MakeKey(s.session_id), j.dump());
     Close(*conn);
     (void)ok;
   }
@@ -233,6 +259,7 @@ class MiniMemoryStore : public SessionStore {
   HttpEndpoint ep_;
   std::string password_;
   int db_;
+  std::string store_namespace_;
 
   struct Conn {
 #ifdef _WIN32
@@ -353,6 +380,16 @@ class MiniMemoryStore : public SessionStore {
     return SendRaw(c, Resp({"SET", key, value}), &resp);
   }
 
+  std::string MakeKey(const std::string& session_id) const {
+    std::string key = "session:";
+    if (!store_namespace_.empty()) {
+      key += store_namespace_;
+      key += ":";
+    }
+    key += session_id;
+    return key;
+  }
+
   std::string Resp(const std::vector<std::string>& args) {
     std::string s = "*" + std::to_string(args.size()) + "\r\n";
     for (const auto& a : args) {
@@ -364,10 +401,14 @@ class MiniMemoryStore : public SessionStore {
 }  // namespace
 
 SessionManager::SessionManager(SessionStoreConfig cfg) {
+  std::string store_namespace = cfg.store_namespace;
+  if (store_namespace.empty() && cfg.type != "memory") {
+    store_namespace = NewId("boot");
+  }
   if (cfg.type == "file" && !cfg.file_path.empty()) {
-    store_ = std::make_unique<FileSessionStore>(cfg.file_path);
+    store_ = std::make_unique<FileSessionStore>(cfg.file_path, store_namespace);
   } else if (cfg.type == "minimemory" || cfg.type == "redis") {
-    store_ = std::make_unique<MiniMemoryStore>(cfg.endpoint, cfg.password, cfg.db);
+    store_ = std::make_unique<MiniMemoryStore>(cfg.endpoint, cfg.password, cfg.db, store_namespace);
   }
 }
 
