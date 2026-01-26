@@ -79,6 +79,7 @@ RuntimeConfig LoadConfigFromEnv() {
 
   if (auto p = GetEnvStr("RUNTIME_PROVIDER"); !p.empty()) cfg.default_provider = p;
   if (auto model = GetEnvStr("LLAMA_CPP_MODEL"); !model.empty()) cfg.llama_cpp_model_path = model;
+  if (auto store = GetEnvStr("RUNTIME_SESSION_STORE"); !store.empty()) cfg.session_store_path = store;
 
   auto ollama = GetEnvStr("OLLAMA_HOST");
   if (!ollama.empty()) cfg.ollama = ParseHttpEndpoint(ollama, 11434);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <nlohmann/json.hpp>
+
 #include <mutex>
 #include <optional>
 #include <string>
@@ -27,13 +29,18 @@ struct Session {
 
 class SessionManager {
  public:
+  explicit SessionManager(std::string store_path = {});
   std::string EnsureSessionId(const std::string& preferred);
   Session GetOrCreate(const std::string& session_id);
   void AppendToHistory(const std::string& session_id, const std::vector<ChatMessage>& messages);
   void AppendTurn(const std::string& session_id, TurnRecord turn);
 
  private:
+  void LoadFromFile();
+  nlohmann::json SnapshotLocked() const;
+  void PersistSnapshot(nlohmann::json snapshot) const;
   std::mutex mu_;
+  std::string store_path_;
   std::unordered_map<std::string, Session> sessions_;
 };
 

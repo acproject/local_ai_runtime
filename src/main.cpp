@@ -22,7 +22,7 @@
 int main() {
   auto cfg = runtime::LoadConfigFromEnv();
 
-  runtime::SessionManager sessions;
+  runtime::SessionManager sessions(cfg.session_store_path);
   runtime::ProviderRegistry providers(cfg.default_provider);
   providers.Register(std::make_unique<runtime::LlamaCppProvider>(cfg.llama_cpp_model_path));
   providers.Register(std::make_unique<runtime::OllamaProvider>(cfg.ollama));
