@@ -301,6 +301,9 @@ static std::string FakeModelOnce(const std::vector<ChatMessage>& messages) {
     if (last_user.find("mcp.echo") != std::string::npos) {
       return R"({"tool_calls":[{"id":"call_1","name":"mcp.echo","arguments":{"text":"hello"}}]})";
     }
+    if (last_user.find("runtime.infer_task_status") != std::string::npos) {
+      return R"({"tool_calls":[{"id":"call_1","name":"runtime.infer_task_status","arguments":{"session_id":"test"}}]})";
+    }
     if (last_user.find("ide.read_file") != std::string::npos) {
       return R"({"tool_calls":[{"id":"call_1","name":"ide.read_file","arguments":{"path":"src/main.cpp"}}]})";
     }
@@ -322,9 +325,10 @@ static std::string FakeModelOnce(const std::vector<ChatMessage>& messages) {
     return R"({"tool_calls":[{"id":"call_1","name":"runtime.add","arguments":{"a":2,"b":3}}]})";
   }
   if (last_user.find("mcp.echo") != std::string::npos || last_user.find("mcp2.mcp.echo") != std::string::npos ||
-      last_user.find("lsp.hover") != std::string::npos || last_user.find("ide.hover") != std::string::npos ||
-      last_user.find("ide.read_file") != std::string::npos || last_user.find("ide.search") != std::string::npos ||
-      last_user.find("ide.definition") != std::string::npos || last_user.find("ide.diagnostics") != std::string::npos) {
+      last_user.find("runtime.infer_task_status") != std::string::npos || last_user.find("lsp.hover") != std::string::npos ||
+      last_user.find("ide.hover") != std::string::npos || last_user.find("ide.read_file") != std::string::npos ||
+      last_user.find("ide.search") != std::string::npos || last_user.find("ide.definition") != std::string::npos ||
+      last_user.find("ide.diagnostics") != std::string::npos) {
     auto pos = last_user.find("TOOL_RESULT");
     if (pos != std::string::npos) {
       return std::string("{\"final\":") + nlohmann::json(last_user).dump() + "}";
@@ -927,6 +931,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
     if (!stream) {
       std::string err;
       ToolLoopResult loop;
+      std::string finish_reason = "stop";
       if (!allowed_tools.empty()) {
         if (planner) {
           loop =
@@ -950,6 +955,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
           auto resp = provider->ChatOnce(creq, &err);
           if (!resp) return SendJson(&res, 502, MakeError(err.empty() ? "upstream error" : err, "api_error"));
           loop.final_text = resp->content;
+          finish_reason = resp->finish_reason;
         }
       }
       if (loop.final_text.empty() && !err.empty()) return SendJson(&res, 502, MakeError(err, "api_error"));
@@ -978,7 +984,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
       nlohmann::json choice;
       choice["index"] = 0;
       choice["message"] = {{"role", "assistant"}, {"content", loop.final_text}};
-      choice["finish_reason"] = "stop";
+      choice["finish_reason"] = finish_reason;
       out["choices"].push_back(std::move(choice));
       out["usage"] = {{"prompt_tokens", nullptr}, {"completion_tokens", nullptr}, {"total_tokens", nullptr}};
       return SendJson(&res, 200, out);
@@ -1009,6 +1015,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
               std::string acc;
               bool wrote_role = false;
               bool write_ok = true;
+              std::string finish_reason = "stop";
 
               auto write_bytes = [&](const std::string& s) -> bool {
                 if (sink.is_writable && !sink.is_writable()) return false;
@@ -1047,14 +1054,16 @@ void OpenAiRouter::Register(httplib::Server* server) {
                     }
                     acc += delta_text;
                   },
-                  []() {},
+                  [&](const std::string& fr) {
+                    finish_reason = fr;
+                  },
                   &stream_err);
 
               if (!ok && !stream_err.empty()) {
                 std::cout << "[provider-error] " << stream_err << "\n";
               }
               if (write_ok) {
-                write_ok = write_chunk(nlohmann::json::object(), "stop");
+                write_ok = write_chunk(nlohmann::json::object(), finish_reason);
               }
 
               if (write_ok) {

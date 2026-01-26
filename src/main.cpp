@@ -12,12 +12,142 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <exception>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <unordered_map>
 #include <string>
+#include <vector>
+
+namespace {
+
+static std::string Trim(std::string s) {
+  size_t start = 0;
+  while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) start++;
+  size_t end = s.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) end--;
+  return s.substr(start, end - start);
+}
+
+static bool StartsWith(const std::string& s, const std::string& prefix) {
+  return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+static std::string ToLower(std::string s) {
+  for (auto& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return s;
+}
+
+static std::vector<std::string> SplitLines(const std::string& text) {
+  std::vector<std::string> out;
+  std::istringstream iss(text);
+  std::string line;
+  while (std::getline(iss, line)) out.push_back(line);
+  return out;
+}
+
+static int StatusScore(const std::string& status) {
+  if (status == "completed") return 3;
+  if (status == "in_progress") return 2;
+  if (status == "pending") return 1;
+  return 0;
+}
+
+static std::optional<std::pair<std::string, std::string>> ParseTodoLine(const std::string& raw_line) {
+  auto line = Trim(raw_line);
+  if (line.empty()) return std::nullopt;
+
+  auto lower = ToLower(line);
+  const std::vector<std::pair<std::string, std::string>> kCheckboxPrefixes = {
+      {"- [ ]", "pending"}, {"* [ ]", "pending"}, {"- [x]", "completed"}, {"* [x]", "completed"}};
+  for (const auto& [prefix, status] : kCheckboxPrefixes) {
+    if (StartsWith(lower, prefix)) {
+      auto text = Trim(line.substr(prefix.size()));
+      if (text.empty()) return std::nullopt;
+      return std::make_pair(text, status);
+    }
+  }
+
+  if (StartsWith(line, "- ") || StartsWith(line, "* ")) {
+    auto text = Trim(line.substr(2));
+    if (text.empty()) return std::nullopt;
+    if (lower.find("in progress") != std::string::npos || lower.find("in_progress") != std::string::npos) {
+      return std::make_pair(text, "in_progress");
+    }
+    if (lower.find("completed") != std::string::npos || lower.find("done") != std::string::npos) {
+      return std::make_pair(text, "completed");
+    }
+    if (lower.find("pending") != std::string::npos) {
+      return std::make_pair(text, "pending");
+    }
+    return std::make_pair(text, "unknown");
+  }
+
+  return std::nullopt;
+}
+
+static void MergeTodo(std::unordered_map<std::string, std::string>* best, const std::string& text, const std::string& status) {
+  auto it = best->find(text);
+  if (it == best->end()) {
+    (*best)[text] = status;
+    return;
+  }
+  if (StatusScore(status) > StatusScore(it->second)) it->second = status;
+}
+
+static nlohmann::json InferTodosFromSession(const runtime::Session& s, int max_history_messages) {
+  std::unordered_map<std::string, std::string> best;
+
+  int start = 0;
+  if (max_history_messages > 0 && static_cast<int>(s.history.size()) > max_history_messages) {
+    start = static_cast<int>(s.history.size()) - max_history_messages;
+  }
+
+  for (size_t i = static_cast<size_t>(start); i < s.history.size(); i++) {
+    const auto& m = s.history[i];
+    if (m.role != "assistant" && m.role != "user") continue;
+    for (const auto& line : SplitLines(m.content)) {
+      auto item = ParseTodoLine(line);
+      if (!item) continue;
+      MergeTodo(&best, item->first, item->second);
+    }
+  }
+
+  nlohmann::json todos = nlohmann::json::array();
+  for (const auto& [text, status] : best) {
+    todos.push_back({{"text", text}, {"status", status}});
+  }
+  return todos;
+}
+
+static nlohmann::json ExtractRecentToolResults(const runtime::Session& s, int max_items) {
+  nlohmann::json out = nlohmann::json::array();
+  if (max_items <= 0) return out;
+
+  for (int i = static_cast<int>(s.history.size()) - 1; i >= 0 && static_cast<int>(out.size()) < max_items; i--) {
+    const auto& m = s.history[static_cast<size_t>(i)];
+    if (m.role != "user") continue;
+    const std::string prefix = "TOOL_RESULT ";
+    if (!StartsWith(m.content, prefix)) continue;
+
+    auto rest = m.content.substr(prefix.size());
+    auto sp = rest.find(' ');
+    if (sp == std::string::npos) continue;
+    auto name = rest.substr(0, sp);
+    auto payload = Trim(rest.substr(sp + 1));
+    auto jr = nlohmann::json::parse(payload, nullptr, false);
+    bool ok = true;
+    if (jr.is_object() && jr.contains("ok") && jr["ok"].is_boolean()) ok = jr["ok"].get<bool>();
+    out.push_back({{"name", name}, {"ok", ok}, {"result", jr.is_discarded() ? nlohmann::json(payload) : jr}});
+  }
+  return out;
+}
+
+}  // namespace
 
 int main() {
   std::cout.setf(std::ios::unitbuf);
@@ -38,6 +168,54 @@ int main() {
   if (cfg.mnn_enabled) providers.Register(std::make_unique<runtime::OpenAiCompatibleHttpProvider>("mnn", cfg.mnn));
   if (cfg.lmdeploy_enabled) providers.Register(std::make_unique<runtime::OpenAiCompatibleHttpProvider>("lmdeploy", cfg.lmdeploy));
   runtime::OpenAiRouter router(&sessions, &providers, runtime::BuildDefaultToolRegistry());
+
+  {
+    auto* tools = router.MutableTools();
+    runtime::ToolSchema schema;
+    schema.name = "runtime.infer_task_status";
+    schema.description = "Infer todo/task status from server session context.";
+    schema.parameters = {{"type", "object"},
+                         {"properties",
+                          {{"session_id", {{"type", "string"}}},
+                           {"max_history_messages", {{"type", "integer"}}},
+                           {"max_recent_tool_results", {{"type", "integer"}}}}},
+                         {"required", {"session_id"}}};
+    tools->RegisterTool(schema, [&, schema](const std::string& tool_call_id, const nlohmann::json& arguments) {
+      runtime::ToolResult tr;
+      tr.tool_call_id = tool_call_id;
+      tr.name = schema.name;
+
+      if (!arguments.is_object() || !arguments.contains("session_id") || !arguments["session_id"].is_string()) {
+        tr.ok = false;
+        tr.error = "missing required field: session_id";
+        tr.result = {{"ok", false}, {"error", tr.error}};
+        return tr;
+      }
+
+      int max_history_messages = 200;
+      int max_recent_tool_results = 20;
+      if (arguments.contains("max_history_messages") && arguments["max_history_messages"].is_number_integer()) {
+        max_history_messages = arguments["max_history_messages"].get<int>();
+      }
+      if (arguments.contains("max_recent_tool_results") && arguments["max_recent_tool_results"].is_number_integer()) {
+        max_recent_tool_results = arguments["max_recent_tool_results"].get<int>();
+      }
+
+      auto session_id = arguments["session_id"].get<std::string>();
+      auto s = sessions.GetOrCreate(session_id);
+
+      nlohmann::json result;
+      result["ok"] = true;
+      result["session_id"] = s.session_id;
+      result["history_messages"] = static_cast<int>(s.history.size());
+      result["turns"] = static_cast<int>(s.turns.size());
+      if (!s.turns.empty()) result["last_turn_id"] = s.turns.back().turn_id;
+      result["todos"] = InferTodosFromSession(s, max_history_messages);
+      result["recent_tool_results"] = ExtractRecentToolResults(s, max_recent_tool_results);
+      tr.result = std::move(result);
+      return tr;
+    });
+  }
 
   std::cout << "[runtime] default_provider=" << cfg.default_provider << "\n";
   std::cout << "[provider] llama_cpp model_path=" << (cfg.llama_cpp_model_path.empty() ? "<empty>" : cfg.llama_cpp_model_path)

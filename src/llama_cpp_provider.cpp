@@ -645,12 +645,15 @@ std::string LlamaCppProvider::BuildPrompt(const std::vector<ChatMessage>& messag
 
 std::optional<ChatResponse> LlamaCppProvider::ChatOnce(const ChatRequest& req, std::string* err) {
   std::string out_text;
+  std::string finish_reason = "stop";
   const bool ok = ChatStream(
       req,
       [&](const std::string& delta) {
         out_text += delta;
       },
-      []() {},
+      [&](const std::string& fr) {
+        finish_reason = fr;
+      },
       err);
   if (!ok) return std::nullopt;
   auto rtrim = [&](std::string& s) {
@@ -675,12 +678,13 @@ std::optional<ChatResponse> LlamaCppProvider::ChatOnce(const ChatRequest& req, s
   r.model = req.model;
   r.content = std::move(out_text);
   r.done = true;
+  r.finish_reason = std::move(finish_reason);
   return r;
 }
 
 bool LlamaCppProvider::ChatStream(const ChatRequest& req,
                                   const std::function<void(const std::string&)>& on_delta,
-                                  const std::function<void()>& on_done,
+                                  const std::function<void(const std::string& finish_reason)>& on_done,
                                   std::string* err) {
   std::lock_guard<std::mutex> lock(mu_);
   auto model_path = ResolveModelPath(req.model, err);
@@ -852,6 +856,7 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   }
 
   std::string out_acc;
+  std::string finish_reason = "stop";
   std::vector<llama_token> gen_tokens;
   gen_tokens.reserve(static_cast<size_t>(std::max(0, max_new_tokens)));
   llama_token last_tok = LLAMA_TOKEN_NULL;
@@ -908,7 +913,10 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
     last_batch.logits = nullptr;
     if (n_ctx > 0) {
       const size_t used = prompt_tokens.size() + gen_tokens.size();
-      if (used >= static_cast<size_t>(n_ctx)) break;
+      if (used >= static_cast<size_t>(n_ctx)) {
+        finish_reason = "length";
+        break;
+      }
     }
     const int32_t rc = llama_decode(ctx_, last_batch);
     if (rc != 0) {
@@ -918,8 +926,14 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
     }
   }
 
+  if (finish_reason == "stop" && max_new_tokens > 0 && gen_tokens.size() >= static_cast<size_t>(max_new_tokens)) {
+    finish_reason = "length";
+  }
+
   llama_sampler_free(sampler);
-  on_done();
+  std::cout << "[llama_cpp] finish_reason=" << finish_reason << " prompt_tokens=" << prompt_tokens.size()
+            << " gen_tokens=" << gen_tokens.size() << " n_ctx=" << n_ctx << " max_new_tokens=" << max_new_tokens << "\n";
+  on_done(finish_reason);
 
   if (gen_cfg.unload_after_chat.has_value() && gen_cfg.unload_after_chat.value()) {
     if (ctx_) {

@@ -185,13 +185,16 @@ std::optional<ChatResponse> OllamaProvider::ChatOnce(const ChatRequest& req, std
   if (jr["message"].contains("content") && jr["message"]["content"].is_string()) {
     out.content = jr["message"]["content"].get<std::string>();
   }
+  if (jr.contains("done_reason") && jr["done_reason"].is_string()) {
+    out.finish_reason = jr["done_reason"].get<std::string>();
+  }
   if (jr.contains("done") && jr["done"].is_boolean()) out.done = jr["done"].get<bool>();
   return out;
 }
 
 bool OllamaProvider::ChatStream(const ChatRequest& req,
                                 const std::function<void(const std::string&)>& on_delta,
-                                const std::function<void()>& on_done,
+                                const std::function<void(const std::string& finish_reason)>& on_done,
                                 std::string* err) {
   auto once = ChatOnce(req, err);
   if (!once) return false;
@@ -200,7 +203,7 @@ bool OllamaProvider::ChatStream(const ChatRequest& req,
   for (size_t i = 0; i < once->content.size(); i += kChunkSize) {
     on_delta(once->content.substr(i, kChunkSize));
   }
-  on_done();
+  on_done(once->finish_reason);
   return true;
 }
 

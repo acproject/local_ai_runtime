@@ -48,13 +48,13 @@ $env:LLAMA_CPP_TOP_P='0.9'; `
 $env:LLAMA_CPP_SEED='42'; `
 $env:LLAMA_CPP_N_GPU_LAYERS='12'; `
 $env:LLAMA_CPP_OFFLOAD_KQV='0'; `
-$env:RUNTIME_SESSION_STORE_TYPE="minimemory"; 
-$env:RUNTIME_SESSION_STORE_ENDPOINT="http://127.0.0.1:6379";
-$env:RUNTIME_SESSION_STORE_PASSWORD="";
-$env:RUNTIME_SESSION_STORE_DB="0";
-$env:RUNTIME_SESSION_STORE_RESET_ON_BOOT='true';
-# 若跨重启共享历史，启用稳定命名空间；否则不要设置此变量;
-# $env:RUNTIME_SESSION_STORE_NAMESPACE="stable";
+$env:RUNTIME_SESSION_STORE_TYPE="minimemory"; `
+$env:RUNTIME_SESSION_STORE_ENDPOINT="http://127.0.0.1:6379";`
+$env:RUNTIME_SESSION_STORE_PASSWORD="";`
+$env:RUNTIME_SESSION_STORE_DB="0";`
+$env:RUNTIME_SESSION_STORE_RESET_ON_BOOT='true';`
+# 若跨重启共享历史，启用稳定命名空间；否则不要设置此变量;`
+# $env:RUNTIME_SESSION_STORE_NAMESPACE="stable";`
 & 'D:\workspace\cpp_projects\local_ai_runtime\build-vs2022-x64-cuda\bin\Release\local-ai-runtime.exe'
 ```
 
