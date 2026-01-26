@@ -52,8 +52,9 @@ $env:RUNTIME_SESSION_STORE_TYPE="minimemory";
 $env:RUNTIME_SESSION_STORE_ENDPOINT="http://127.0.0.1:6379";
 $env:RUNTIME_SESSION_STORE_PASSWORD="";
 $env:RUNTIME_SESSION_STORE_DB="0";
-# 若跨重启共享历史，启用稳定命名空间；否则不要设置此变量
-# $env:RUNTIME_SESSION_STORE_NAMESPACE="stable"
+$env:RUNTIME_SESSION_STORE_RESET_ON_BOOT='true';
+# 若跨重启共享历史，启用稳定命名空间；否则不要设置此变量;
+# $env:RUNTIME_SESSION_STORE_NAMESPACE="stable";
 & 'D:\workspace\cpp_projects\local_ai_runtime\build-vs2022-x64-cuda\bin\Release\local-ai-runtime.exe'
 ```
 

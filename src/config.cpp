@@ -76,6 +76,20 @@ static std::string ToLower(std::string s) {
   return s;
 }
 
+static bool TryParseBool(const std::string& s, bool* out) {
+  if (!out) return false;
+  const std::string v = ToLower(s);
+  if (v == "1" || v == "true" || v == "yes" || v == "y" || v == "on") {
+    *out = true;
+    return true;
+  }
+  if (v == "0" || v == "false" || v == "no" || v == "n" || v == "off") {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 RuntimeConfig LoadConfigFromEnv() {
@@ -103,6 +117,10 @@ RuntimeConfig LoadConfigFromEnv() {
   if (auto spw = GetEnvStr("RUNTIME_SESSION_STORE_PASSWORD"); !spw.empty()) cfg.session_store_password = spw;
   if (auto sdb = GetEnvStr("RUNTIME_SESSION_STORE_DB"); !sdb.empty()) cfg.session_store_db = std::atoi(sdb.c_str());
   if (auto sns = GetEnvStr("RUNTIME_SESSION_STORE_NAMESPACE"); !sns.empty()) cfg.session_store_namespace = sns;
+  if (auto sreset = GetEnvStr("RUNTIME_SESSION_STORE_RESET_ON_BOOT"); !sreset.empty()) {
+    bool b = false;
+    if (TryParseBool(sreset, &b)) cfg.session_store_reset_on_boot = b;
+  }
 
   auto ollama = GetEnvStr("OLLAMA_HOST");
   if (!ollama.empty()) cfg.ollama = ParseHttpEndpoint(ollama, 11434);

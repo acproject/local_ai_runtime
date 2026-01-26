@@ -401,8 +401,11 @@ class MiniMemoryStore : public SessionStore {
 }  // namespace
 
 SessionManager::SessionManager(SessionStoreConfig cfg) {
+  reset_on_boot_ = cfg.reset_on_boot;
   std::string store_namespace = cfg.store_namespace;
-  if (store_namespace.empty() && cfg.type != "memory") {
+  if (reset_on_boot_ && cfg.type != "memory") {
+    store_namespace = NewId("boot");
+  } else if (store_namespace.empty() && cfg.type != "memory") {
     store_namespace = NewId("boot");
   }
   if (cfg.type == "file" && !cfg.file_path.empty()) {
@@ -420,7 +423,14 @@ std::string NewId(const std::string& prefix) {
 }
 
 std::string SessionManager::EnsureSessionId(const std::string& preferred) {
-  if (!preferred.empty()) return preferred;
+  if (!preferred.empty()) {
+    if (reset_on_boot_) {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (sessions_.find(preferred) != sessions_.end()) return preferred;
+      return NewId("sess");
+    }
+    return preferred;
+  }
   return NewId("sess");
 }
 
@@ -432,7 +442,7 @@ Session SessionManager::GetOrCreate(const std::string& session_id) {
     if (it != sessions_.end()) return it->second;
   }
   bool found = false;
-  if (store_) {
+  if (store_ && !reset_on_boot_) {
     auto loaded = store_->Load(session_id);
     if (loaded) {
       out = *loaded;

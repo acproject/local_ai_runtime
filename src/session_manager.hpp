@@ -35,6 +35,7 @@ struct SessionStoreConfig {
   std::string password;
   int db = 0;
   std::string store_namespace;
+  bool reset_on_boot = false;
 };
 
 class SessionStore;
@@ -54,6 +55,7 @@ class SessionManager {
   std::mutex mu_;
   std::unique_ptr<SessionStore> store_;
   std::unordered_map<std::string, Session> sessions_;
+  bool reset_on_boot_ = false;
 };
 
 std::string NewId(const std::string& prefix);
