@@ -22,7 +22,11 @@ struct RuntimeConfig {
   HttpListenConfig listen;
   std::string default_provider = "llama_cpp";
   std::string llama_cpp_model_path;
+  std::string session_store_type = "memory";
   std::string session_store_path;
+  HttpEndpoint session_store_endpoint;
+  std::string session_store_password;
+  int session_store_db = 0;
   HttpEndpoint ollama;
   HttpEndpoint mnn;
   HttpEndpoint lmdeploy;

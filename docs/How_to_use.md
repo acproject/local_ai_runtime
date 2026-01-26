@@ -46,8 +46,12 @@ $env:LLAMA_CPP_N_UBATCH='64'; `
 $env:LLAMA_CPP_TEMPERATURE='0.7'; `
 $env:LLAMA_CPP_TOP_P='0.9'; `
 $env:LLAMA_CPP_SEED='42'; `
-$env:LLAMA_CPP_N_GPU_LAYERS='8'; `
+$env:LLAMA_CPP_N_GPU_LAYERS='12'; `
 $env:LLAMA_CPP_OFFLOAD_KQV='0'; `
+$env:RUNTIME_SESSION_STORE_TYPE="minimemory"; 
+$env:RUNTIME_SESSION_STORE_ENDPOINT="http://127.0.0.1:6379";
+$env:RUNTIME_SESSION_STORE_PASSWORD="";
+$env:RUNTIME_SESSION_STORE_DB="0";
 & 'D:\workspace\cpp_projects\local_ai_runtime\build-vs2022-x64-cuda\bin\Release\local-ai-runtime.exe'
 ```
 

@@ -69,6 +69,13 @@ static std::vector<std::string> SplitCsv(const std::string& s) {
   return filtered;
 }
 
+static std::string ToLower(std::string s) {
+  for (auto& c : s) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  return s;
+}
+
 }  // namespace
 
 RuntimeConfig LoadConfigFromEnv() {
@@ -80,6 +87,21 @@ RuntimeConfig LoadConfigFromEnv() {
   if (auto p = GetEnvStr("RUNTIME_PROVIDER"); !p.empty()) cfg.default_provider = p;
   if (auto model = GetEnvStr("LLAMA_CPP_MODEL"); !model.empty()) cfg.llama_cpp_model_path = model;
   if (auto store = GetEnvStr("RUNTIME_SESSION_STORE"); !store.empty()) cfg.session_store_path = store;
+  if (auto stype = GetEnvStr("RUNTIME_SESSION_STORE_TYPE"); !stype.empty()) cfg.session_store_type = ToLower(stype);
+  if (cfg.session_store_type.empty() && !cfg.session_store_path.empty()) cfg.session_store_type = "file";
+  bool session_store_endpoint_set = false;
+  if (auto ep = GetEnvStr("RUNTIME_SESSION_STORE_ENDPOINT"); !ep.empty()) {
+    cfg.session_store_endpoint = ParseHttpEndpoint(ep, 6385);
+    session_store_endpoint_set = true;
+  }
+  if (cfg.session_store_endpoint.port == 11434) cfg.session_store_endpoint.port = 6385;
+  if (!session_store_endpoint_set) {
+    if (cfg.session_store_type == "minimemory" || cfg.session_store_type == "redis") {
+      cfg.session_store_endpoint = ParseHttpEndpoint("http://127.0.0.1:6379", 6379);
+    }
+  }
+  if (auto spw = GetEnvStr("RUNTIME_SESSION_STORE_PASSWORD"); !spw.empty()) cfg.session_store_password = spw;
+  if (auto sdb = GetEnvStr("RUNTIME_SESSION_STORE_DB"); !sdb.empty()) cfg.session_store_db = std::atoi(sdb.c_str());
 
   auto ollama = GetEnvStr("OLLAMA_HOST");
   if (!ollama.empty()) cfg.ollama = ParseHttpEndpoint(ollama, 11434);
