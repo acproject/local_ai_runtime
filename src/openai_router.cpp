@@ -445,12 +445,14 @@ static bool ValidateSchemaLoose(const nlohmann::json& schema, const nlohmann::js
 
 static std::string ChatOnceText(const std::string& model,
                                 const std::vector<ChatMessage>& messages,
+                                const std::optional<int>& max_tokens,
                                 IProvider* provider,
                                 std::string* err) {
   if (model == "fake-tool") return FakeModelOnce(messages);
   ChatRequest req;
   req.model = model;
   req.stream = false;
+  req.max_tokens = max_tokens;
   req.messages = messages;
   auto resp = provider->ChatOnce(req, err);
   if (!resp) return {};
@@ -462,6 +464,7 @@ static ToolLoopResult RunPlanner(const std::string& model,
                                  const std::vector<ToolSchema>& allowed_tools,
                                  const ToolRegistry& registry,
                                  IProvider* provider,
+                                 const std::optional<int>& max_tokens,
                                  int max_plan_steps,
                                  int max_plan_rewrites,
                                  int max_tool_calls,
@@ -485,7 +488,7 @@ static ToolLoopResult RunPlanner(const std::string& model,
   std::string plan_text;
   int rewrites = 0;
   for (int attempt = 0; attempt <= max_plan_rewrites; attempt++) {
-    plan_text = ChatOnceText(model, plan_msgs, provider, err);
+    plan_text = ChatOnceText(model, plan_msgs, max_tokens, provider, err);
     if (plan_text.empty() && err && !err->empty()) {
       out.planner_failed = true;
       return out;
@@ -608,7 +611,7 @@ static ToolLoopResult RunPlanner(const std::string& model,
   final_msgs.push_back({"system", BuildPlannerFinalSystemPrompt()});
   for (const auto& m : exec_msgs) final_msgs.push_back(m);
 
-  auto final_text = ChatOnceText(model, final_msgs, provider, err);
+  auto final_text = ChatOnceText(model, final_msgs, max_tokens, provider, err);
   out.steps = 2;
   if (auto final = ExtractFinalFromAssistantJson(final_text)) {
     out.final_text = *final;
@@ -623,6 +626,7 @@ static ToolLoopResult RunToolLoop(const std::string& model,
                                   const std::vector<ToolSchema>& allowed_tools,
                                   const ToolRegistry& registry,
                                   IProvider* provider,
+                                  const std::optional<int>& max_tokens,
                                   int max_steps,
                                   int max_tool_calls,
                                   std::string* err) {
@@ -651,6 +655,7 @@ static ToolLoopResult RunToolLoop(const std::string& model,
       ChatRequest req;
       req.model = model;
       req.stream = false;
+      req.max_tokens = max_tokens;
       req.messages = msgs;
       auto resp = provider->ChatOnce(req, err);
       if (!resp) return out;
@@ -874,6 +879,12 @@ void OpenAiRouter::Register(httplib::Server* server) {
 
     bool stream = false;
     if (j.contains("stream") && j["stream"].is_boolean()) stream = j["stream"].get<bool>();
+    std::optional<int> max_tokens;
+    if (j.contains("max_tokens") && j["max_tokens"].is_number_integer()) {
+      max_tokens = j["max_tokens"].get<int>();
+    } else if (j.contains("max_completion_tokens") && j["max_completion_tokens"].is_number_integer()) {
+      max_tokens = j["max_completion_tokens"].get<int>();
+    }
 
     int max_steps = 6;
     if (j.contains("max_steps") && j["max_steps"].is_number_integer()) max_steps = j["max_steps"].get<int>();
@@ -935,14 +946,14 @@ void OpenAiRouter::Register(httplib::Server* server) {
       if (!allowed_tools.empty()) {
         if (planner) {
           loop =
-              RunPlanner(provider_model, full_messages, allowed_tools, tools_, provider, max_plan_steps, max_plan_rewrites,
+              RunPlanner(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, max_plan_steps, max_plan_rewrites,
                          max_tool_calls,
                          &err);
           if (loop.planner_failed) {
-            loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_steps, max_tool_calls, &err);
+            loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, max_steps, max_tool_calls, &err);
           }
         } else {
-          loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_steps, max_tool_calls, &err);
+          loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, max_steps, max_tool_calls, &err);
         }
       } else {
         if (model == "fake-tool") {
@@ -951,6 +962,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
           ChatRequest creq;
           creq.model = provider_model;
           creq.stream = false;
+          creq.max_tokens = max_tokens;
           creq.messages = full_messages;
           auto resp = provider->ChatOnce(creq, &err);
           if (!resp) return SendJson(&res, 502, MakeError(err.empty() ? "upstream error" : err, "api_error"));
@@ -974,6 +986,9 @@ void OpenAiRouter::Register(httplib::Server* server) {
         }
         sessions_->AppendToHistory(session_id, {ChatMessage{"assistant", loop.final_text}});
       }
+
+      std::cout << "[chat] session_id=" << session_id << " stream=0 max_tokens=" << (max_tokens.has_value() ? max_tokens.value() : -1)
+                << " finish_reason=" << finish_reason << " output_chars=" << loop.final_text.size() << "\n";
 
       nlohmann::json out;
       out["id"] = NewId("chatcmpl");
@@ -1003,6 +1018,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
       ChatRequest creq;
       creq.model = provider_model;
       creq.stream = true;
+      creq.max_tokens = max_tokens;
       creq.messages = full_messages;
 
       res.set_chunked_content_provider(
@@ -1062,6 +1078,9 @@ void OpenAiRouter::Register(httplib::Server* server) {
               if (!ok && !stream_err.empty()) {
                 std::cout << "[provider-error] " << stream_err << "\n";
               }
+              std::cout << "[chat] session_id=" << session_id << " stream=1 max_tokens="
+                        << (creq.max_tokens.has_value() ? creq.max_tokens.value() : -1) << " finish_reason=" << finish_reason
+                        << " output_chars=" << acc.size() << " write_ok=" << (write_ok ? 1 : 0) << "\n";
               if (write_ok) {
                 write_ok = write_chunk(nlohmann::json::object(), finish_reason);
               }
@@ -1092,13 +1111,13 @@ void OpenAiRouter::Register(httplib::Server* server) {
     if (!allowed_tools.empty()) {
       if (planner) {
         loop =
-            RunPlanner(provider_model, full_messages, allowed_tools, tools_, provider, max_plan_steps, max_plan_rewrites,
+            RunPlanner(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, max_plan_steps, max_plan_rewrites,
                        max_tool_calls, &err);
         if (loop.planner_failed) {
-          loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_steps, max_tool_calls, &err);
+          loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, max_steps, max_tool_calls, &err);
         }
       } else {
-        loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_steps, max_tool_calls, &err);
+        loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, max_steps, max_tool_calls, &err);
       }
     } else {
       loop.final_text = FakeModelOnce(full_messages);

@@ -4,6 +4,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ENGINE = None
+MOCK_BYTES = 0
 
 
 class HfEngine:
@@ -143,13 +144,36 @@ class Handler(BaseHTTPRequestHandler):
                         temperature=j.get("temperature"),
                         top_p=j.get("top_p"),
                     )
+                    finish_reason = "stop"
                 else:
                     msg = ""
                     if messages:
                         last = messages[-1]
                         if isinstance(last, dict):
                             msg = str(last.get("content") or "")
-                    content = f"mock:n={len(messages)} last={msg}"
+                    max_req = j.get("max_tokens") or j.get("max_completion_tokens")
+                    max_req_i = None
+                    try:
+                        if max_req is not None:
+                            max_req_i = int(max_req)
+                    except Exception:
+                        max_req_i = None
+
+                    if MOCK_BYTES and MOCK_BYTES > 0:
+                        cap = MOCK_BYTES
+                        finish_reason = "stop"
+                        if max_req_i is not None and max_req_i > 0 and cap > max_req_i:
+                            cap = max_req_i
+                            finish_reason = "length"
+                        head = f"mock-long:n={len(messages)} bytes={cap} last={msg}\n"
+                        fill = ("0123456789abcdef" * 1024) + "\n"
+                        out = head
+                        while len(out) < cap:
+                            out += fill
+                        content = out[:cap]
+                    else:
+                        content = f"mock:n={len(messages)} last={msg}"
+                        finish_reason = "stop"
 
                 self._send(
                     200,
@@ -162,7 +186,7 @@ class Handler(BaseHTTPRequestHandler):
                             {
                                 "index": 0,
                                 "message": {"role": "assistant", "content": content},
-                                "finish_reason": "stop",
+                                "finish_reason": finish_reason,
                             }
                         ],
                         "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
@@ -199,6 +223,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=19002)
+    ap.add_argument("--mock-bytes", type=int, default=0)
     ap.add_argument("--hf-model-path")
     ap.add_argument("--hf-model-id", default="hf-model")
     ap.add_argument("--device", default="cpu")
@@ -206,7 +231,8 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=128)
     args = ap.parse_args()
 
-    global ENGINE
+    global ENGINE, MOCK_BYTES
+    MOCK_BYTES = int(args.mock_bytes or 0)
     if args.hf_model_path:
         ENGINE = HfEngine(
             model_path=args.hf_model_path,

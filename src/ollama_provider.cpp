@@ -159,6 +159,9 @@ std::optional<ChatResponse> OllamaProvider::ChatOnce(const ChatRequest& req, std
   nlohmann::json j;
   j["model"] = req.model;
   j["stream"] = false;
+  if (req.max_tokens.has_value() && req.max_tokens.value() > 0) {
+    j["options"] = {{"num_predict", req.max_tokens.value()}};
+  }
   j["messages"] = nlohmann::json::array();
   for (const auto& m : req.messages) {
     nlohmann::json jm;

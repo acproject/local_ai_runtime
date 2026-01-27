@@ -18,6 +18,7 @@ struct ChatRequest {
   std::string model;
   std::vector<ChatMessage> messages;
   bool stream = false;
+  std::optional<int> max_tokens;
 };
 
 struct ChatResponse {

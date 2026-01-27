@@ -96,6 +96,9 @@ std::optional<ChatResponse> OpenAiCompatibleHttpProvider::ChatOnce(const ChatReq
   nlohmann::json j;
   j["model"] = req.model;
   j["stream"] = false;
+  if (req.max_tokens.has_value() && req.max_tokens.value() > 0) {
+    j["max_tokens"] = req.max_tokens.value();
+  }
   j["messages"] = nlohmann::json::array();
   for (const auto& m : req.messages) {
     j["messages"].push_back({{"role", m.role}, {"content", m.content}});
