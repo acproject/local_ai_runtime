@@ -694,6 +694,7 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   llama_memory_clear(llama_get_memory(ctx_), false);
 
   std::string prompt;
+  bool used_chat_template = false;
   const char* tmpl = llama_model_chat_template(model_, nullptr);
   if (tmpl && tmpl[0] != '\0') {
     std::vector<llama_chat_message> chat;
@@ -716,6 +717,7 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
     if (n > 0) {
       buf.resize(static_cast<size_t>(n));
       prompt = std::move(buf);
+      used_chat_template = true;
     } else {
       prompt = BuildPrompt(req.messages);
     }
@@ -864,6 +866,13 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   gen_tokens.reserve(static_cast<size_t>(std::max(0, max_new_tokens)));
   llama_token last_tok = LLAMA_TOKEN_NULL;
   int last_tok_run = 0;
+  std::string emit_buf;
+  auto flush_emit = [&]() {
+    if (emit_buf.empty()) return;
+    on_delta(emit_buf);
+    emit_buf.clear();
+  };
+  bool stop_generation = false;
   for (int i = 0; i < max_new_tokens; i++) {
     const int32_t sample_i = std::max<int32_t>(0, last_batch.n_tokens - 1);
     llama_token next = llama_sampler_sample(sampler, ctx_, sample_i);
@@ -891,24 +900,34 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
           }
         }
         if (same) {
-          i = max_new_tokens;
+          stop_generation = true;
           break;
         }
       }
     }
+    if (stop_generation) break;
 
     auto piece = TokenToPiece(vocab, next);
     if (!piece.empty()) {
       out_acc += piece;
-      auto stop_at = [&](const std::string& s) -> bool {
-        return !s.empty() && out_acc.size() >= s.size() && out_acc.compare(out_acc.size() - s.size(), s.size(), s) == 0;
-      };
-      if (stop_at("\nUser:") || stop_at("\nUSER:") || stop_at("\nAssistant:") || stop_at("\nASSISTANT:") || stop_at("USER:") ||
-          stop_at("ASSISTANT:")) {
-        break;
+      emit_buf += piece;
+      if (!used_chat_template) {
+        auto ends_with = [&](const std::string& s) -> bool {
+          return !s.empty() && out_acc.size() >= s.size() && out_acc.compare(out_acc.size() - s.size(), s.size(), s) == 0;
+        };
+        for (const auto& s : {std::string("\nUser:"), std::string("\nUSER:"), std::string("\nAssistant:"), std::string("\nASSISTANT:")}) {
+          if (!ends_with(s)) continue;
+          out_acc.resize(out_acc.size() - s.size());
+          if (emit_buf.size() >= s.size() && emit_buf.compare(emit_buf.size() - s.size(), s.size(), s) == 0) {
+            emit_buf.resize(emit_buf.size() - s.size());
+          }
+          stop_generation = true;
+          break;
+        }
       }
-      on_delta(piece);
+      if (emit_buf.size() >= 128) flush_emit();
     }
+    if (stop_generation) break;
 
     static thread_local std::vector<llama_token> next_token_buf(1);
     next_token_buf[0] = next;
@@ -933,6 +952,7 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
     finish_reason = "length";
   }
 
+  flush_emit();
   llama_sampler_free(sampler);
   std::cout << "[llama_cpp] finish_reason=" << finish_reason << " prompt_tokens=" << prompt_tokens.size()
             << " gen_tokens=" << gen_tokens.size() << " n_ctx=" << n_ctx << " max_new_tokens=" << max_new_tokens << "\n";

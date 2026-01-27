@@ -57,6 +57,13 @@ static nlohmann::json MakeError(const std::string& message, const std::string& t
   return j;
 }
 
+static nlohmann::json MakeAnthropicError(const std::string& message, const std::string& type) {
+  nlohmann::json j;
+  j["type"] = "error";
+  j["error"] = {{"type", type}, {"message", message}};
+  return j;
+}
+
 static void SendJson(httplib::Response* res, int status, const nlohmann::json& body) {
   res->status = status;
   res->set_header("Content-Type", "application/json");
@@ -69,6 +76,10 @@ static std::string SseData(const nlohmann::json& j) {
 
 static std::string SseDone() {
   return "data: [DONE]\n\n";
+}
+
+static std::string SseEvent(const std::string& event, const nlohmann::json& j) {
+  return std::string("event: ") + event + "\n" + "data: " + j.dump() + "\n\n";
 }
 
 static nlohmann::json ParseJsonBody(const httplib::Request& req) {
@@ -194,6 +205,12 @@ static bool ToolChoiceIsNone(const nlohmann::json& j) {
   if (tc.is_string()) return tc.get<std::string>() == "none";
   if (tc.is_object() && tc.contains("type") && tc["type"].is_string()) return tc["type"].get<std::string>() == "none";
   return false;
+}
+
+static std::string MapFinishReasonToAnthropicStopReason(const std::string& finish_reason) {
+  if (finish_reason == "length") return "max_tokens";
+  if (finish_reason == "content_filter") return "end_turn";
+  return "end_turn";
 }
 
 static std::string BuildToolSystemPrompt(const std::vector<ToolSchema>& tools) {
@@ -1293,12 +1310,272 @@ void OpenAiRouter::Register(httplib::Server* server) {
     SendJson(&res, 200, out);
   };
 
+  auto anthropic_messages_handler = [&](const httplib::Request& req, httplib::Response& res) {
+    LogRequestRaw(req);
+    auto j = ParseJsonBody(req);
+    if (j.is_discarded()) return SendJson(&res, 400, MakeAnthropicError("invalid json body", "invalid_request_error"));
+    if (!j.contains("model") || !j["model"].is_string()) {
+      return SendJson(&res, 400, MakeAnthropicError("missing field: model", "invalid_request_error"));
+    }
+    if (!j.contains("messages") || !j["messages"].is_array()) {
+      return SendJson(&res, 400, MakeAnthropicError("missing field: messages", "invalid_request_error"));
+    }
+
+    std::string model = j["model"].get<std::string>();
+    bool ok = false;
+    auto req_messages = ParseChatMessages(j, &ok);
+    if (!ok) return SendJson(&res, 400, MakeAnthropicError("missing field: messages", "invalid_request_error"));
+
+    std::string system_text;
+    if (j.contains("system")) system_text = ExtractMessageContent(j["system"]);
+
+    std::vector<ChatMessage> full_messages;
+    if (!system_text.empty()) full_messages.push_back(ChatMessage{"system", system_text});
+    full_messages.insert(full_messages.end(), req_messages.begin(), req_messages.end());
+
+    bool stream = false;
+    if (j.contains("stream") && j["stream"].is_boolean()) stream = j["stream"].get<bool>();
+    std::optional<int> max_tokens;
+    if (j.contains("max_tokens") && j["max_tokens"].is_number_integer()) max_tokens = j["max_tokens"].get<int>();
+
+    IProvider* provider = nullptr;
+    std::string provider_model = model;
+    if (model != "fake-tool") {
+      auto resolved = providers_ ? providers_->Resolve(model) : std::nullopt;
+      if (!resolved) return SendJson(&res, 400, MakeAnthropicError("unknown provider in model", "invalid_request_error"));
+      provider = resolved->provider;
+      provider_model = resolved->model;
+      if (providers_) {
+        auto sw = providers_->Activate(resolved->provider_name);
+        if (sw.switched) {
+          std::cout << "[provider-switch] from=" << sw.from << " to=" << sw.to << "\n";
+        }
+      }
+      LogProviderUse(resolved->provider_name, resolved->model);
+    }
+
+    if (!stream) {
+      std::string err;
+      std::string content;
+      std::string finish_reason = "stop";
+      if (model == "fake-tool") {
+        content = FakeModelOnce(full_messages);
+      } else {
+        ChatRequest creq;
+        creq.model = provider_model;
+        creq.stream = false;
+        creq.max_tokens = max_tokens;
+        creq.messages = full_messages;
+        auto resp = provider->ChatOnce(creq, &err);
+        if (!resp) return SendJson(&res, 502, MakeAnthropicError(err.empty() ? "upstream error" : err, "api_error"));
+        content = resp->content;
+        finish_reason = resp->finish_reason;
+      }
+
+      nlohmann::json out;
+      out["id"] = NewId("msg");
+      out["type"] = "message";
+      out["role"] = "assistant";
+      out["content"] = nlohmann::json::array({{{"type", "text"}, {"text", content}}});
+      out["model"] = model;
+      out["stop_reason"] = MapFinishReasonToAnthropicStopReason(finish_reason);
+      out["stop_sequence"] = nullptr;
+      out["usage"] = {{"input_tokens", nullptr}, {"output_tokens", nullptr}};
+      return SendJson(&res, 200, out);
+    }
+
+    res.status = 200;
+    res.set_header("Content-Type", "text/event-stream");
+    res.set_header("Cache-Control", "no-cache");
+    res.set_header("Connection", "keep-alive");
+
+    auto id = NewId("msg");
+    if (model == "fake-tool") {
+      res.set_chunked_content_provider(
+          "text/event-stream",
+          [=](size_t, httplib::DataSink& sink) mutable {
+            auto write_bytes = [&](const std::string& s) -> bool {
+              if (sink.is_writable && !sink.is_writable()) return false;
+              if (!sink.write) return false;
+              return sink.write(s.data(), s.size());
+            };
+
+            const auto content = FakeModelOnce(full_messages);
+            nlohmann::json start;
+            start["type"] = "message_start";
+            start["message"] = {{"id", id},
+                                {"type", "message"},
+                                {"role", "assistant"},
+                                {"content", nlohmann::json::array()},
+                                {"model", model},
+                                {"stop_reason", nullptr},
+                                {"stop_sequence", nullptr},
+                                {"usage", {{"input_tokens", nullptr}, {"output_tokens", nullptr}}}};
+            if (!write_bytes(SseEvent("message_start", start))) {
+              sink.done();
+              return false;
+            }
+
+            nlohmann::json cbs;
+            cbs["type"] = "content_block_start";
+            cbs["index"] = 0;
+            cbs["content_block"] = {{"type", "text"}, {"text", ""}};
+            if (!write_bytes(SseEvent("content_block_start", cbs))) {
+              sink.done();
+              return false;
+            }
+
+            nlohmann::json delta;
+            delta["type"] = "content_block_delta";
+            delta["index"] = 0;
+            delta["delta"] = {{"type", "text_delta"}, {"text", content}};
+            if (!write_bytes(SseEvent("content_block_delta", delta))) {
+              sink.done();
+              return false;
+            }
+
+            nlohmann::json cbstop;
+            cbstop["type"] = "content_block_stop";
+            cbstop["index"] = 0;
+            if (!write_bytes(SseEvent("content_block_stop", cbstop))) {
+              sink.done();
+              return false;
+            }
+
+            nlohmann::json md;
+            md["type"] = "message_delta";
+            md["delta"] = {{"stop_reason", "end_turn"}, {"stop_sequence", nullptr}};
+            md["usage"] = {{"output_tokens", nullptr}};
+            if (!write_bytes(SseEvent("message_delta", md))) {
+              sink.done();
+              return false;
+            }
+
+            nlohmann::json stop;
+            stop["type"] = "message_stop";
+            if (!write_bytes(SseEvent("message_stop", stop))) {
+              sink.done();
+              return false;
+            }
+            sink.done();
+            return true;
+          },
+          [](bool) {});
+      return;
+    }
+
+    ChatRequest creq;
+    creq.model = provider_model;
+    creq.stream = true;
+    creq.max_tokens = max_tokens;
+    creq.messages = full_messages;
+
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [=](size_t, httplib::DataSink& sink) mutable {
+          try {
+            auto write_bytes = [&](const std::string& s) -> bool {
+              if (sink.is_writable && !sink.is_writable()) return false;
+              if (!sink.write) return false;
+              return sink.write(s.data(), s.size());
+            };
+
+            nlohmann::json start;
+            start["type"] = "message_start";
+            start["message"] = {{"id", id},
+                                {"type", "message"},
+                                {"role", "assistant"},
+                                {"content", nlohmann::json::array()},
+                                {"model", model},
+                                {"stop_reason", nullptr},
+                                {"stop_sequence", nullptr},
+                                {"usage", {{"input_tokens", nullptr}, {"output_tokens", nullptr}}}};
+            if (!write_bytes(SseEvent("message_start", start))) {
+              sink.done();
+              return false;
+            }
+
+            nlohmann::json cbs;
+            cbs["type"] = "content_block_start";
+            cbs["index"] = 0;
+            cbs["content_block"] = {{"type", "text"}, {"text", ""}};
+            if (!write_bytes(SseEvent("content_block_start", cbs))) {
+              sink.done();
+              return false;
+            }
+
+            std::string finish_reason = "stop";
+            std::string stream_err;
+            bool wrote_any = false;
+            const bool ok_stream = provider->ChatStream(
+                creq,
+                [&](const std::string& delta_text) {
+                  wrote_any = true;
+                  nlohmann::json delta;
+                  delta["type"] = "content_block_delta";
+                  delta["index"] = 0;
+                  delta["delta"] = {{"type", "text_delta"}, {"text", delta_text}};
+                  write_bytes(SseEvent("content_block_delta", delta));
+                },
+                [&](const std::string& fr) { finish_reason = fr; },
+                &stream_err);
+            if (!ok_stream && !stream_err.empty()) {
+              sink.done();
+              return false;
+            }
+
+            if (!wrote_any) {
+              nlohmann::json delta;
+              delta["type"] = "content_block_delta";
+              delta["index"] = 0;
+              delta["delta"] = {{"type", "text_delta"}, {"text", ""}};
+              if (!write_bytes(SseEvent("content_block_delta", delta))) {
+                sink.done();
+                return false;
+              }
+            }
+
+            nlohmann::json cbstop;
+            cbstop["type"] = "content_block_stop";
+            cbstop["index"] = 0;
+            if (!write_bytes(SseEvent("content_block_stop", cbstop))) {
+              sink.done();
+              return false;
+            }
+
+            nlohmann::json md;
+            md["type"] = "message_delta";
+            md["delta"] = {{"stop_reason", MapFinishReasonToAnthropicStopReason(finish_reason)}, {"stop_sequence", nullptr}};
+            md["usage"] = {{"output_tokens", nullptr}};
+            if (!write_bytes(SseEvent("message_delta", md))) {
+              sink.done();
+              return false;
+            }
+
+            nlohmann::json stop;
+            stop["type"] = "message_stop";
+            if (!write_bytes(SseEvent("message_stop", stop))) {
+              sink.done();
+              return false;
+            }
+
+            sink.done();
+            return true;
+          } catch (...) {
+            sink.done();
+            return false;
+          }
+        },
+        [](bool) {});
+  };
+
   for (const auto& raw_prefix : prefixes) {
     const auto prefix = NormalizePrefix(raw_prefix);
     server->Get(prefix + "/v1/models", models_handler);
     server->Post(prefix + "/v1/embeddings", embeddings_handler);
     server->Post(prefix + "/v1/chat/completions", chat_completions_handler);
     server->Post(prefix + "/v1/responses", responses_handler);
+    server->Post(prefix + "/v1/messages", anthropic_messages_handler);
   }
 }
 
