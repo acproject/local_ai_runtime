@@ -1111,7 +1111,9 @@ void OpenAiRouter::Register(httplib::Server* server) {
                 }
               }
 
-              if (write_ok) write_bytes(SseDone());
+              if (write_ok) {
+                write_ok = write_bytes(SseDone());
+              }
               sink.done();
               return write_ok;
             } catch (...) {
