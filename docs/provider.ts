@@ -1758,7 +1758,7 @@ export namespace Provider {
   }
 
   const OPENAI_DONE_MARKERS = [new TextEncoder().encode("data: [DONE]"), new TextEncoder().encode("data:[DONE]")]
-  const OPENAI_DONE_DELIMS = [new TextEncoder().encode("\n\n"), new TextEncoder().encode("\r\n\r\n")]
+  const OPENAI_DONE_DELIM = new TextEncoder().encode("\n\n")
 
   function isChatCompletionsURL(raw: string) {
     try {
@@ -1792,8 +1792,7 @@ export namespace Provider {
     if (!contentType.toLowerCase().includes("text/event-stream")) return response
 
     const reader = response.body.getReader()
-    const maxDelimLen = Math.max(...OPENAI_DONE_DELIMS.map((d) => d.length))
-    const markerTailLen = Math.max(...OPENAI_DONE_MARKERS.map((m) => m.length)) + maxDelimLen
+    const markerTailLen = Math.max(...OPENAI_DONE_MARKERS.map((m) => m.length)) + OPENAI_DONE_DELIM.length
 
     let carry = new Uint8Array(0)
     let foundMarker = false
@@ -1801,20 +1800,6 @@ export namespace Provider {
     const stream = new ReadableStream<Uint8Array>({
       async pull(controller) {
         while (true) {
-          if (foundMarker && carry.length) {
-            for (const delim of OPENAI_DONE_DELIMS) {
-              const delimIndex = indexOfBytes(carry, delim)
-              if (delimIndex !== -1) {
-                const end = delimIndex + delim.length
-                controller.enqueue(carry.slice(0, end))
-                carry = new Uint8Array(0)
-                await reader.cancel()
-                controller.close()
-                return
-              }
-            }
-          }
-
           const { value, done } = await reader.read()
           if (done) {
             if (carry.length) controller.enqueue(carry)
@@ -1844,17 +1829,16 @@ export namespace Provider {
             foundMarker = true
             if (markerIndex > 0) controller.enqueue(combined.slice(0, markerIndex))
             carry = combined.slice(markerIndex)
-            for (const delim of OPENAI_DONE_DELIMS) {
-              const delimIndex = indexOfBytes(carry, delim)
-              if (delimIndex !== -1) {
-                const end = delimIndex + delim.length
-                controller.enqueue(carry.slice(0, end))
-                carry = new Uint8Array(0)
-                await reader.cancel()
-                controller.close()
-                return
-              }
-            }
+            continue
+          }
+
+          const delimIndex = indexOfBytes(carry, OPENAI_DONE_DELIM)
+          if (delimIndex !== -1) {
+            const end = delimIndex + OPENAI_DONE_DELIM.length
+            controller.enqueue(carry.slice(0, end))
+            carry = new Uint8Array(0)
+            await reader.cancel()
+            controller.close()
             return
           }
 
