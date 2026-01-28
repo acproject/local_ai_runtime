@@ -1025,7 +1025,8 @@ void OpenAiRouter::Register(httplib::Server* server) {
     res.status = 200;
     res.set_header("Content-Type", "text/event-stream");
     res.set_header("Cache-Control", "no-cache");
-    res.set_header("Connection", "keep-alive");
+    res.set_header("Connection", "close");
+    res.set_header("X-Accel-Buffering", "no");
     res.set_header("x-turn-id", turn_id);
 
     auto id = NewId("chatcmpl");
@@ -1073,8 +1074,8 @@ void OpenAiRouter::Register(httplib::Server* server) {
               std::string stream_err;
               const bool ok = provider->ChatStream(
                   creq,
-                  [&](const std::string& delta_text) {
-                    if (!write_ok) return;
+                  [&](const std::string& delta_text) -> bool {
+                    if (!write_ok) return false;
                     nlohmann::json delta;
                     if (!wrote_role) {
                       delta["role"] = "assistant";
@@ -1083,9 +1084,10 @@ void OpenAiRouter::Register(httplib::Server* server) {
                     delta["content"] = delta_text;
                     if (!write_chunk(delta, nullptr)) {
                       write_ok = false;
-                      return;
+                      return false;
                     }
                     acc += delta_text;
+                    return true;
                   },
                   [&](const std::string& fr) {
                     finish_reason = fr;
@@ -1115,7 +1117,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
                 write_ok = write_bytes(SseDone());
               }
               sink.done();
-              return write_ok;
+              return false;
             } catch (...) {
               sink.done();
               return false;
@@ -1244,7 +1246,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
               return false;
             }
             sink.done();
-            return true;
+            return false;
           } catch (...) {
             sink.done();
             return false;
@@ -1389,7 +1391,8 @@ void OpenAiRouter::Register(httplib::Server* server) {
     res.status = 200;
     res.set_header("Content-Type", "text/event-stream");
     res.set_header("Cache-Control", "no-cache");
-    res.set_header("Connection", "keep-alive");
+    res.set_header("Connection", "close");
+    res.set_header("X-Accel-Buffering", "no");
 
     auto id = NewId("msg");
     if (model == "fake-tool") {
@@ -1460,7 +1463,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
               return false;
             }
             sink.done();
-            return true;
+            return false;
           },
           [](bool) {});
       return;
@@ -1511,13 +1514,14 @@ void OpenAiRouter::Register(httplib::Server* server) {
             bool wrote_any = false;
             const bool ok_stream = provider->ChatStream(
                 creq,
-                [&](const std::string& delta_text) {
+                [&](const std::string& delta_text) -> bool {
                   wrote_any = true;
                   nlohmann::json delta;
                   delta["type"] = "content_block_delta";
                   delta["index"] = 0;
                   delta["delta"] = {{"type", "text_delta"}, {"text", delta_text}};
-                  write_bytes(SseEvent("content_block_delta", delta));
+                  if (!write_bytes(SseEvent("content_block_delta", delta))) return false;
+                  return true;
                 },
                 [&](const std::string& fr) { finish_reason = fr; },
                 &stream_err);
@@ -1562,7 +1566,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
             }
 
             sink.done();
-            return true;
+            return false;
           } catch (...) {
             sink.done();
             return false;

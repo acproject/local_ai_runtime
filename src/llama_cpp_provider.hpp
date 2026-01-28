@@ -27,7 +27,7 @@ class LlamaCppProvider : public IProvider {
 
   std::optional<ChatResponse> ChatOnce(const ChatRequest& req, std::string* err) override;
   bool ChatStream(const ChatRequest& req,
-                  const std::function<void(const std::string&)>& on_delta,
+                  const std::function<bool(const std::string&)>& on_delta,
                   const std::function<void(const std::string& finish_reason)>& on_done,
                   std::string* err) override;
 

@@ -193,7 +193,7 @@ std::optional<ChatResponse> OllamaProvider::ChatOnce(const ChatRequest& req, std
 }
 
 bool OllamaProvider::ChatStream(const ChatRequest& req,
-                                const std::function<void(const std::string&)>& on_delta,
+                                const std::function<bool(const std::string&)>& on_delta,
                                 const std::function<void(const std::string& finish_reason)>& on_done,
                                 std::string* err) {
   auto once = ChatOnce(req, err);
@@ -201,7 +201,7 @@ bool OllamaProvider::ChatStream(const ChatRequest& req,
 
   constexpr size_t kChunkSize = 64;
   for (size_t i = 0; i < once->content.size(); i += kChunkSize) {
-    on_delta(once->content.substr(i, kChunkSize));
+    if (!on_delta(once->content.substr(i, kChunkSize))) return false;
   }
   on_done(once->finish_reason);
   return true;

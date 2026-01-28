@@ -81,7 +81,7 @@ def _sse_chat(
     payload: Dict[str, Any],
     timeout_s: float,
     headers: Dict[str, str],
-) -> Tuple[str, Optional[str], bool]:
+) -> Tuple[str, Optional[str], bool, Optional[str]]:
     u = urlparse(f"{base_url}/v1/chat/completions")
     if u.scheme != "http":
         raise RuntimeError(f"only http is supported, got {u.scheme}")
@@ -91,6 +91,7 @@ def _sse_chat(
     h.update(headers)
     conn.request("POST", u.path, body=body, headers=h)
     resp = conn.getresponse()
+    next_session_id = resp.getheader("x-session-id") or resp.getheader("X-Session-Id")
     if resp.status < 200 or resp.status >= 300:
         raw = resp.read().decode("utf-8", errors="replace")
         conn.close()
@@ -137,7 +138,7 @@ def _sse_chat(
             conn.close()
         except Exception:
             pass
-    return acc, finish_reason, done
+    return acc, finish_reason, done, next_session_id
 
 
 @dataclass
@@ -178,7 +179,9 @@ def _send_one(state: ChatState, role: str, content: str) -> str:
     }
     if state.stream:
         payload["stream"] = True
-        text, fr, done = _sse_chat(state.base_url, payload, timeout_s=state.timeout_s, headers=state.headers())
+        text, fr, done, next_session_id = _sse_chat(state.base_url, payload, timeout_s=state.timeout_s, headers=state.headers())
+        if next_session_id and next_session_id != state.session_id:
+            state.session_id = next_session_id
         sys.stdout.write("\n")
         sys.stdout.flush()
         if fr is None and done:
@@ -186,7 +189,12 @@ def _send_one(state: ChatState, role: str, content: str) -> str:
         state.messages.append({"role": "assistant", "content": text})
         return text
 
-    st, _, body = _http_json("POST", f"{state.base_url}/v1/chat/completions", payload, timeout_s=state.timeout_s, headers=state.headers())
+    st, resp_headers, body = _http_json(
+        "POST", f"{state.base_url}/v1/chat/completions", payload, timeout_s=state.timeout_s, headers=state.headers()
+    )
+    next_session_id = resp_headers.get("x-session-id") or resp_headers.get("X-Session-Id")
+    if next_session_id and next_session_id != state.session_id:
+        state.session_id = next_session_id
     if st < 200 or st >= 300:
         raise RuntimeError(f"chat failed: http {st}: {body[:500]}")
     j = json.loads(body)
@@ -404,4 +412,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -650,6 +651,7 @@ std::optional<ChatResponse> LlamaCppProvider::ChatOnce(const ChatRequest& req, s
       req,
       [&](const std::string& delta) {
         out_text += delta;
+        return true;
       },
       [&](const std::string& fr) {
         finish_reason = fr;
@@ -683,7 +685,7 @@ std::optional<ChatResponse> LlamaCppProvider::ChatOnce(const ChatRequest& req, s
 }
 
 bool LlamaCppProvider::ChatStream(const ChatRequest& req,
-                                  const std::function<void(const std::string&)>& on_delta,
+                                  const std::function<bool(const std::string&)>& on_delta,
                                   const std::function<void(const std::string& finish_reason)>& on_done,
                                   std::string* err) {
   std::lock_guard<std::mutex> lock(mu_);
@@ -789,29 +791,34 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
 
   auto sparams = llama_sampler_chain_default_params();
   sparams.no_perf = true;
-  llama_sampler* sampler = llama_sampler_chain_init(sparams);
+  struct SamplerDeleter {
+    void operator()(llama_sampler* s) const {
+      if (s) llama_sampler_free(s);
+    }
+  };
+  std::unique_ptr<llama_sampler, SamplerDeleter> sampler(llama_sampler_chain_init(sparams));
   if (!sampler) {
     if (err) *err = "llama_cpp: failed to init sampler";
     return false;
   }
-  llama_sampler_chain_add(sampler, llama_sampler_init_penalties(penalty_last_n, penalty_repeat, 0.0f, 0.0f));
+  llama_sampler_chain_add(sampler.get(), llama_sampler_init_penalties(penalty_last_n, penalty_repeat, 0.0f, 0.0f));
   if (temperature > 0.0f) {
-    llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
+    llama_sampler_chain_add(sampler.get(), llama_sampler_init_temp(temperature));
   }
   if (top_p > 0.0f && top_p < 1.0f) {
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
+    llama_sampler_chain_add(sampler.get(), llama_sampler_init_top_p(top_p, 1));
   }
   if (temperature <= 0.0f && !(top_p > 0.0f && top_p < 1.0f)) {
-    llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+    llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
   } else {
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(static_cast<uint32_t>(seed)));
+    llama_sampler_chain_add(sampler.get(), llama_sampler_init_dist(static_cast<uint32_t>(seed)));
   }
 
   if (penalty_last_n != 0 && !prompt_tokens.empty()) {
     const size_t n_accept =
         (penalty_last_n < 0) ? prompt_tokens.size() : std::min(prompt_tokens.size(), static_cast<size_t>(penalty_last_n));
     for (size_t i = prompt_tokens.size() - n_accept; i < prompt_tokens.size(); i++) {
-      llama_sampler_accept(sampler, prompt_tokens[i]);
+      llama_sampler_accept(sampler.get(), prompt_tokens[i]);
     }
   }
 
@@ -825,7 +832,6 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
       batch.logits = nullptr;
       const int32_t rc = llama_encode(ctx_, batch);
       if (rc != 0) {
-        llama_sampler_free(sampler);
         if (err) *err = "llama_cpp: encode failed (code " + std::to_string(rc) + ")";
         return false;
       }
@@ -840,7 +846,6 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
     last_batch.logits = nullptr;
     const int32_t rc = llama_decode(ctx_, last_batch);
     if (rc != 0) {
-      llama_sampler_free(sampler);
       if (err) *err = "llama_cpp: decode failed (code " + std::to_string(rc) + ")";
       return false;
     }
@@ -851,7 +856,6 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
       batch.logits = nullptr;
       const int32_t rc = llama_decode(ctx_, batch);
       if (rc != 0) {
-        llama_sampler_free(sampler);
         if (err) *err = "llama_cpp: decode failed (code " + std::to_string(rc) + ")";
         return false;
       }
@@ -867,16 +871,21 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   llama_token last_tok = LLAMA_TOKEN_NULL;
   int last_tok_run = 0;
   std::string emit_buf;
+  bool stop_generation = false;
   auto flush_emit = [&]() {
     if (emit_buf.empty()) return;
-    on_delta(emit_buf);
+    if (!on_delta(emit_buf)) {
+      emit_buf.clear();
+      stop_generation = true;
+      finish_reason = "cancelled";
+      return;
+    }
     emit_buf.clear();
   };
-  bool stop_generation = false;
   for (int i = 0; i < max_new_tokens; i++) {
     const int32_t sample_i = std::max<int32_t>(0, last_batch.n_tokens - 1);
-    llama_token next = llama_sampler_sample(sampler, ctx_, sample_i);
-    llama_sampler_accept(sampler, next);
+    llama_token next = llama_sampler_sample(sampler.get(), ctx_, sample_i);
+    llama_sampler_accept(sampler.get(), next);
     if (llama_vocab_is_eog(vocab, next)) break;
 
     gen_tokens.push_back(next);
@@ -942,7 +951,6 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
     }
     const int32_t rc = llama_decode(ctx_, last_batch);
     if (rc != 0) {
-      llama_sampler_free(sampler);
       if (err) *err = "llama_cpp: decode failed (code " + std::to_string(rc) + ")";
       return false;
     }
@@ -953,7 +961,6 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   }
 
   flush_emit();
-  llama_sampler_free(sampler);
   std::cout << "[llama_cpp] finish_reason=" << finish_reason << " prompt_tokens=" << prompt_tokens.size()
             << " gen_tokens=" << gen_tokens.size() << " n_ctx=" << n_ctx << " max_new_tokens=" << max_new_tokens << "\n";
   on_done(finish_reason);

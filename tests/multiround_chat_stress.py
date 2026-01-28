@@ -41,6 +41,61 @@ def http_json(
     except Exception as e:
         return 0, {}, str(e)
 
+def http_stream(
+    method: str,
+    url: str,
+    payload: Optional[Dict[str, Any]] = None,
+    timeout_s: float = 300.0,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> Tuple[int, Dict[str, str], str]:
+    data = None
+    headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method)
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            out = ""
+            while True:
+                raw = resp.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not line:
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                payload = line[len("data:") :].lstrip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    j = json.loads(payload)
+                except Exception:
+                    continue
+                choices = j.get("choices") or []
+                if not choices or not isinstance(choices, list):
+                    continue
+                delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+                if not isinstance(delta, dict):
+                    continue
+                piece = delta.get("content")
+                if isinstance(piece, str) and piece:
+                    out += piece
+            return int(resp.status), dict(resp.headers.items()), out
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return int(e.code), dict(e.headers.items()) if e.headers else {}, body
+    except Exception as e:
+        return 0, {}, str(e)
+
 
 def wait_ready(base_url: str, timeout_s: float = 30.0) -> None:
     deadline = time.time() + timeout_s
@@ -209,32 +264,47 @@ def chat_once(
     timeout_s: float = 300.0,
     extra_headers: Optional[Dict[str, str]] = None,
     extra_payload: Optional[Dict[str, Any]] = None,
+    stream: bool = False,
 ) -> Tuple[str, Dict[str, str]]:
     payload = {
         "model": model,
         "messages": messages,
-        "stream": False,
+        "stream": bool(stream),
     }
     if extra_payload:
         payload.update(extra_payload)
-    st, resp_headers, body = http_json(
-        "POST",
-        f"{base_url}/v1/chat/completions",
-        payload,
-        timeout_s=timeout_s,
-        extra_headers=extra_headers,
-    )
+    if stream:
+        st, resp_headers, body = http_stream(
+            "POST",
+            f"{base_url}/v1/chat/completions",
+            payload,
+            timeout_s=timeout_s,
+            extra_headers=extra_headers,
+        )
+    else:
+        st, resp_headers, body = http_json(
+            "POST",
+            f"{base_url}/v1/chat/completions",
+            payload,
+            timeout_s=timeout_s,
+            extra_headers=extra_headers,
+        )
     if st < 200 or st >= 300:
         raise RuntimeError(f"chat failed: http {st}: {body}")
-    j = json.loads(body)
-    choices = j.get("choices") or []
-    if not choices or not isinstance(choices, list):
-        raise RuntimeError(f"invalid response: {body}")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not isinstance(content, str):
-        raise RuntimeError(f"invalid response: {body}")
-    return content, resp_headers
+    if stream:
+        if not isinstance(body, str):
+            raise RuntimeError("invalid stream output")
+        return body, resp_headers
+    else:
+        j = json.loads(body)
+        choices = j.get("choices") or []
+        if not choices or not isinstance(choices, list):
+            raise RuntimeError(f"invalid response: {body}")
+        msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, str):
+            raise RuntimeError(f"invalid response: {body}")
+        return content, resp_headers
 
 
 def main() -> int:
@@ -243,6 +313,7 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=18081)
     ap.add_argument("--model")
     ap.add_argument("--model-contains", default="Qwen3-VL-8B-Instruct")
+    ap.add_argument("--stream", action="store_true")
     ap.add_argument("--rounds", type=int, default=20)
     ap.add_argument("--turns-per-round", type=int, default=2)
     ap.add_argument("--sleep-ms", type=int, default=0)
@@ -346,7 +417,7 @@ def main() -> int:
                 ]
 
                 for t in range(args.turns_per_round):
-                    last_assistant, _ = chat_once(base_url, model, messages, timeout_s=300.0)
+                    last_assistant, _ = chat_once(base_url, model, messages, timeout_s=300.0, stream=args.stream)
                     messages.append(msg("assistant", last_assistant))
                     if t + 1 < args.turns_per_round:
                         messages.append(msg("user", "基于上一句，再补充一个要点（不要重复）。"))
@@ -374,6 +445,7 @@ def main() -> int:
                         timeout_s=300.0,
                         extra_headers=extra_headers,
                         extra_payload=extra_payload,
+                        stream=args.stream,
                     )
                     if session_id is None:
                         session_id = resp_headers.get("x-session-id") or resp_headers.get("X-Session-Id")

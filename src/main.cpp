@@ -620,6 +620,21 @@ int main() {
     res.set_content(j.dump(), "application/json");
   });
 
-  server.listen(cfg.listen.host, cfg.listen.port);
-  return 0;
+  server.set_keep_alive_timeout(5);
+  server.set_read_timeout(60);
+  server.set_write_timeout(60);
+
+  server.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
+    nlohmann::json j;
+    j["ok"] = true;
+    j["unix_seconds"] =
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    res.status = 200;
+    res.set_content(j.dump(), "application/json");
+  });
+
+  std::cout << "[http] listen host=" << cfg.listen.host << " port=" << cfg.listen.port << "\n";
+  const bool ok = server.listen(cfg.listen.host, cfg.listen.port);
+  std::cout << "[http] listen returned ok=" << (ok ? 1 : 0) << "\n";
+  return ok ? 0 : 1;
 }
