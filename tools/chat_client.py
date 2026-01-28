@@ -12,6 +12,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 
+def _clean_text_for_json(s: str) -> str:
+    try:
+        return s.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
 def _no_proxy_env() -> None:
     os.environ["NO_PROXY"] = "127.0.0.1,localhost"
     os.environ["no_proxy"] = "127.0.0.1,localhost"
@@ -32,7 +39,7 @@ def _http_json(
     if headers:
         h.update(headers)
     if payload is not None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="replace")
     req = urllib.request.Request(url, data=data, method=method, headers=h)
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
@@ -86,7 +93,7 @@ def _sse_chat(
     if u.scheme != "http":
         raise RuntimeError(f"only http is supported, got {u.scheme}")
     conn = HTTPConnection(u.hostname, u.port, timeout=timeout_s)
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="replace")
     h = {"Content-Type": "application/json", "Accept": "text/event-stream"}
     h.update(headers)
     conn.request("POST", u.path, body=body, headers=h)
@@ -158,20 +165,20 @@ class ChatState:
     def reset_history(self) -> None:
         self.messages = []
         if self.system_prompt:
-            self.messages.append({"role": "system", "content": self.system_prompt})
+            self.messages.append({"role": "system", "content": _clean_text_for_json(self.system_prompt)})
 
     def ensure_system(self) -> None:
         if not self.system_prompt:
             return
         if self.messages and self.messages[0].get("role") == "system":
-            self.messages[0] = {"role": "system", "content": self.system_prompt}
+            self.messages[0] = {"role": "system", "content": _clean_text_for_json(self.system_prompt)}
             return
-        self.messages.insert(0, {"role": "system", "content": self.system_prompt})
+        self.messages.insert(0, {"role": "system", "content": _clean_text_for_json(self.system_prompt)})
 
 
 def _send_one(state: ChatState, role: str, content: str) -> str:
     state.ensure_system()
-    state.messages.append({"role": role, "content": content})
+    state.messages.append({"role": role, "content": _clean_text_for_json(content)})
     payload: Dict[str, Any] = {
         "model": state.model,
         "messages": state.messages,
@@ -186,7 +193,7 @@ def _send_one(state: ChatState, role: str, content: str) -> str:
         sys.stdout.flush()
         if fr is None and done:
             fr = "stop"
-        state.messages.append({"role": "assistant", "content": text})
+        state.messages.append({"role": "assistant", "content": _clean_text_for_json(text)})
         return text
 
     st, resp_headers, body = _http_json(
@@ -205,7 +212,7 @@ def _send_one(state: ChatState, role: str, content: str) -> str:
             msg = choices[0].get("message")
             if isinstance(msg, dict) and isinstance(msg.get("content"), str):
                 txt = msg["content"]
-    state.messages.append({"role": "assistant", "content": txt})
+    state.messages.append({"role": "assistant", "content": _clean_text_for_json(txt)})
     return txt
 
 

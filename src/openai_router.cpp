@@ -1097,11 +1097,11 @@ void OpenAiRouter::Register(httplib::Server* server) {
               if (!ok && !stream_err.empty()) {
                 std::cout << "[provider-error] " << stream_err << "\n";
               }
-              std::cout << "[chat] session_id=" << session_id << " stream=1 max_tokens="
-                        << (creq.max_tokens.has_value() ? creq.max_tokens.value() : -1) << " finish_reason=" << finish_reason
-                        << " output_chars=" << acc.size() << " write_ok=" << (write_ok ? 1 : 0) << "\n";
+              bool finish_ok = false;
+              bool done_ok = false;
               if (write_ok) {
-                write_ok = write_chunk(nlohmann::json::object(), finish_reason);
+                finish_ok = write_chunk(nlohmann::json::object(), finish_reason);
+                write_ok = finish_ok;
               }
 
               if (write_ok) {
@@ -1114,13 +1114,18 @@ void OpenAiRouter::Register(httplib::Server* server) {
               }
 
               if (write_ok) {
-                write_ok = write_bytes(SseDone());
+                done_ok = write_bytes(SseDone());
+                write_ok = done_ok;
               }
+              std::cout << "[chat] session_id=" << session_id << " stream=1 max_tokens="
+                        << (creq.max_tokens.has_value() ? creq.max_tokens.value() : -1) << " finish_reason=" << finish_reason
+                        << " output_chars=" << acc.size() << " finish_ok=" << (finish_ok ? 1 : 0) << " done_ok=" << (done_ok ? 1 : 0)
+                        << "\n";
               sink.done();
-              return false;
+              return true;
             } catch (...) {
               sink.done();
-              return false;
+              return true;
             }
           },
           [](bool) {});
@@ -1246,10 +1251,10 @@ void OpenAiRouter::Register(httplib::Server* server) {
               return false;
             }
             sink.done();
-            return false;
+            return true;
           } catch (...) {
             sink.done();
-            return false;
+            return true;
           }
         },
         [](bool) {});
@@ -1463,7 +1468,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
               return false;
             }
             sink.done();
-            return false;
+            return true;
           },
           [](bool) {});
       return;
@@ -1566,10 +1571,10 @@ void OpenAiRouter::Register(httplib::Server* server) {
             }
 
             sink.done();
-            return false;
+            return true;
           } catch (...) {
             sink.done();
-            return false;
+            return true;
           }
         },
         [](bool) {});

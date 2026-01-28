@@ -290,6 +290,21 @@ class MiniMemoryStore : public SessionStore {
     ) {
       return std::nullopt;
     }
+
+    {
+#ifdef _WIN32
+      DWORD timeout_ms = 1000;
+      setsockopt(c.fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+      setsockopt(c.fd, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+#else
+      timeval tv{};
+      tv.tv_sec = 1;
+      tv.tv_usec = 0;
+      setsockopt(c.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      setsockopt(c.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+    }
+
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(ep_.port);
@@ -327,24 +342,50 @@ class MiniMemoryStore : public SessionStore {
   }
 
   bool SendRaw(Conn& c, const std::string& cmd, std::string* out_resp) {
-    if (
+    size_t sent = 0;
+    while (sent < cmd.size()) {
 #ifdef _WIN32
-        send(c.fd, cmd.c_str(), static_cast<int>(cmd.size()), 0) == SOCKET_ERROR
+      int n = send(c.fd, cmd.data() + sent, static_cast<int>(cmd.size() - sent), 0);
+      if (n == SOCKET_ERROR || n <= 0) return false;
 #else
-        send(c.fd, cmd.c_str(), cmd.size(), 0) < 0
+      ssize_t n = send(c.fd, cmd.data() + sent, cmd.size() - sent, 0);
+      if (n <= 0) return false;
 #endif
-    ) {
-      return false;
+      sent += static_cast<size_t>(n);
     }
-    char buf[8192];
+
+    auto is_resp_complete = [](const std::string& resp) -> bool {
+      if (resp.empty()) return false;
+      const char t = resp[0];
+      if (t == '+' || t == '-' || t == ':') {
+        return resp.find("\r\n") != std::string::npos;
+      }
+      if (t == '$') {
+        auto crlf = resp.find("\r\n");
+        if (crlf == std::string::npos) return false;
+        int len = std::atoi(resp.substr(1, crlf - 1).c_str());
+        if (len < 0) return true;
+        const size_t need = static_cast<size_t>(crlf + 2) + static_cast<size_t>(len) + 2;
+        return resp.size() >= need;
+      }
+      return resp.find("\r\n") != std::string::npos;
+    };
+
+    std::string resp;
+    resp.reserve(256);
+    char buf[4096];
+    for (;;) {
 #ifdef _WIN32
-    int n = recv(c.fd, buf, sizeof(buf) - 1, 0);
+      int n = recv(c.fd, buf, static_cast<int>(sizeof(buf)), 0);
 #else
-    ssize_t n = recv(c.fd, buf, sizeof(buf) - 1, 0);
+      ssize_t n = recv(c.fd, buf, sizeof(buf), 0);
 #endif
-    if (n <= 0) return false;
-    buf[n] = '\0';
-    if (out_resp) *out_resp = std::string(buf, n);
+      if (n <= 0) return false;
+      resp.append(buf, static_cast<size_t>(n));
+      if (is_resp_complete(resp)) break;
+      if (resp.size() > 2 * 1024 * 1024) return false;
+    }
+    if (out_resp) *out_resp = std::move(resp);
     return true;
   }
 
@@ -424,11 +465,6 @@ std::string NewId(const std::string& prefix) {
 
 std::string SessionManager::EnsureSessionId(const std::string& preferred) {
   if (!preferred.empty()) {
-    if (reset_on_boot_) {
-      std::lock_guard<std::mutex> lock(mu_);
-      if (sessions_.find(preferred) != sessions_.end()) return preferred;
-      return NewId("sess");
-    }
     return preferred;
   }
   return NewId("sess");
