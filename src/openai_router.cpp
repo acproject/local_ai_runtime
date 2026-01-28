@@ -1122,10 +1122,10 @@ void OpenAiRouter::Register(httplib::Server* server) {
                         << " output_chars=" << acc.size() << " finish_ok=" << (finish_ok ? 1 : 0) << " done_ok=" << (done_ok ? 1 : 0)
                         << "\n";
               sink.done();
-              return true;
+              return false;
             } catch (...) {
               sink.done();
-              return true;
+              return false;
             }
           },
           [](bool) {});
@@ -1251,10 +1251,10 @@ void OpenAiRouter::Register(httplib::Server* server) {
               return false;
             }
             sink.done();
-            return true;
+            return false;
           } catch (...) {
             sink.done();
-            return true;
+            return false;
           }
         },
         [](bool) {});
@@ -1468,7 +1468,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
               return false;
             }
             sink.done();
-            return true;
+            return false;
           },
           [](bool) {});
       return;
@@ -1571,10 +1571,10 @@ void OpenAiRouter::Register(httplib::Server* server) {
             }
 
             sink.done();
-            return true;
+            return false;
           } catch (...) {
             sink.done();
-            return true;
+            return false;
           }
         },
         [](bool) {});
