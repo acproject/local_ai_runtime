@@ -99,6 +99,9 @@ std::optional<ChatResponse> OpenAiCompatibleHttpProvider::ChatOnce(const ChatReq
   if (req.max_tokens.has_value() && req.max_tokens.value() > 0) {
     j["max_tokens"] = req.max_tokens.value();
   }
+  if (req.temperature.has_value()) j["temperature"] = req.temperature.value();
+  if (req.top_p.has_value()) j["top_p"] = req.top_p.value();
+  if (req.min_p.has_value()) j["min_p"] = req.min_p.value();
   j["messages"] = nlohmann::json::array();
   for (const auto& m : req.messages) {
     j["messages"].push_back({{"role", m.role}, {"content", m.content}});

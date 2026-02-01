@@ -85,6 +85,10 @@ static std::string ToLowerAscii(std::string s) {
   return s;
 }
 
+static bool IsGlmFamilyModel(const std::string& model) {
+  return ToLowerAscii(model).find("glm") != std::string::npos;
+}
+
 static bool TryParseInt32(const std::string& s, int32_t* out) {
   if (!out) return false;
   if (s.empty()) return false;
@@ -162,6 +166,7 @@ struct LlamaRuntimeConfig {
   std::optional<int32_t> max_new_tokens;
   std::optional<float> temperature;
   std::optional<float> top_p;
+  std::optional<float> min_p;
   std::optional<int32_t> seed;
   std::optional<int32_t> penalty_last_n;
   std::optional<float> penalty_repeat;
@@ -261,6 +266,12 @@ static LlamaRuntimeConfig LoadLlamaRuntimeConfigFromEnv() {
     const std::string v = GetEnvStr("LLAMA_CPP_TOP_P");
     float f = 0.0f;
     if (!v.empty() && TryParseFloat(TrimWs(v), &f) && f >= 0.0f && f <= 1.0f) cfg.top_p = f;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_MIN_P");
+    float f = 0.0f;
+    if (!v.empty() && TryParseFloat(TrimWs(v), &f) && f >= 0.0f && f <= 1.0f) cfg.min_p = f;
   }
 
   {
@@ -756,8 +767,13 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   }
   const int penalty_last_n = gen_cfg.penalty_last_n.has_value() ? gen_cfg.penalty_last_n.value() : 64;
   const float penalty_repeat = gen_cfg.penalty_repeat.has_value() ? gen_cfg.penalty_repeat.value() : 1.1f;
-  const float temperature = gen_cfg.temperature.has_value() ? gen_cfg.temperature.value() : 0.0f;
-  const float top_p = gen_cfg.top_p.has_value() ? gen_cfg.top_p.value() : 0.0f;
+  const float temperature =
+      req.temperature.has_value() ? req.temperature.value() : (gen_cfg.temperature.has_value() ? gen_cfg.temperature.value() : 0.0f);
+  const float top_p = req.top_p.has_value() ? req.top_p.value() : (gen_cfg.top_p.has_value() ? gen_cfg.top_p.value() : 0.0f);
+  float min_p = req.min_p.has_value() ? req.min_p.value() : (gen_cfg.min_p.has_value() ? gen_cfg.min_p.value() : 0.0f);
+  if (!req.min_p.has_value() && !gen_cfg.min_p.has_value() && IsGlmFamilyModel(req.model)) {
+    min_p = 0.01f;
+  }
   const int32_t seed = gen_cfg.seed.has_value() ? gen_cfg.seed.value() : static_cast<int32_t>(LLAMA_DEFAULT_SEED);
 
   if (n_ctx > 0) {
@@ -808,7 +824,11 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   if (top_p > 0.0f && top_p < 1.0f) {
     llama_sampler_chain_add(sampler.get(), llama_sampler_init_top_p(top_p, 1));
   }
-  if (temperature <= 0.0f && !(top_p > 0.0f && top_p < 1.0f)) {
+  if (min_p > 0.0f && min_p < 1.0f) {
+    llama_sampler_chain_add(sampler.get(), llama_sampler_init_min_p(min_p, 1));
+  }
+  const bool has_sampling_filter = (top_p > 0.0f && top_p < 1.0f) || (min_p > 0.0f && min_p < 1.0f);
+  if (temperature <= 0.0f && !has_sampling_filter) {
     llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
   } else {
     llama_sampler_chain_add(sampler.get(), llama_sampler_init_dist(static_cast<uint32_t>(seed)));

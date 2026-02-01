@@ -236,9 +236,45 @@ int main() {
   std::vector<std::unordered_map<std::string, std::string>> mcp_name_maps;
 
   auto normalize_under_root = [&](const std::string& path_or_uri, std::string* out_path, std::string* err) -> bool {
+    auto percent_decode = [&](const std::string& in) -> std::string {
+      std::string out;
+      out.reserve(in.size());
+      for (size_t i = 0; i < in.size(); i++) {
+        const char ch = in[i];
+        if (ch == '%' && i + 2 < in.size()) {
+          const char a = in[i + 1];
+          const char b = in[i + 2];
+          auto hex = [](char x) -> int {
+            if (x >= '0' && x <= '9') return x - '0';
+            if (x >= 'a' && x <= 'f') return 10 + (x - 'a');
+            if (x >= 'A' && x <= 'F') return 10 + (x - 'A');
+            return -1;
+          };
+          const int ha = hex(a);
+          const int hb = hex(b);
+          if (ha >= 0 && hb >= 0) {
+            out.push_back(static_cast<char>((ha << 4) | hb));
+            i += 2;
+            continue;
+          }
+        }
+        out.push_back(ch);
+      }
+      return out;
+    };
+
     std::string raw = path_or_uri;
+    const std::string lower = ToLower(raw);
     constexpr const char* kFileScheme = "file://";
-    if (raw.rfind(kFileScheme, 0) == 0) raw = raw.substr(std::strlen(kFileScheme));
+    if (lower.rfind(kFileScheme, 0) == 0) {
+      raw = raw.substr(std::strlen(kFileScheme));
+      if (raw.rfind("localhost/", 0) == 0) raw = raw.substr(std::strlen("localhost/"));
+      if (!raw.empty() && raw[0] == '/' && raw.size() >= 3 && std::isalpha(static_cast<unsigned char>(raw[1])) &&
+          raw[2] == ':') {
+        raw = raw.substr(1);
+      }
+      raw = percent_decode(raw);
+    }
     std::filesystem::path p = raw;
     if (!cfg.workspace_root.empty() && p.is_relative()) p = std::filesystem::path(cfg.workspace_root) / p;
     std::error_code ec;
@@ -262,6 +298,12 @@ int main() {
     }
     if (out_path) *out_path = canon.generic_string();
     return true;
+  };
+
+  auto make_file_uri = [&](const std::string& normalized_path) -> std::string {
+    if (normalized_path.empty()) return "file:///";
+    if (normalized_path[0] == '/') return std::string("file://") + normalized_path;
+    return std::string("file:///") + normalized_path;
   };
 
   auto refresh_mcp_tools = [&]() {
@@ -464,7 +506,7 @@ int main() {
           return tr;
         }
         nlohmann::json args;
-        args["uri"] = std::string("file://") + norm;
+        args["uri"] = make_file_uri(norm);
         auto r = call_any_mcp("lsp.diagnostics", args, &err);
         if (!r) {
           tr.ok = false;
@@ -513,7 +555,7 @@ int main() {
           return tr;
         }
         nlohmann::json args;
-        args["uri"] = std::string("file://") + norm;
+        args["uri"] = make_file_uri(norm);
         args["line"] = arguments["line"];
         args["character"] = arguments["character"];
         auto r = call_any_mcp("lsp.hover", args, &err);
@@ -564,7 +606,7 @@ int main() {
           return tr;
         }
         nlohmann::json args;
-        args["uri"] = std::string("file://") + norm;
+        args["uri"] = make_file_uri(norm);
         args["line"] = arguments["line"];
         args["character"] = arguments["character"];
         auto r = call_any_mcp("lsp.definition", args, &err);

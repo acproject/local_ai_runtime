@@ -19,6 +19,9 @@ struct ChatRequest {
   std::vector<ChatMessage> messages;
   bool stream = false;
   std::optional<int> max_tokens;
+  std::optional<float> temperature;
+  std::optional<float> top_p;
+  std::optional<float> min_p;
 };
 
 struct ChatResponse {

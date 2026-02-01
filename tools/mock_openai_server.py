@@ -174,6 +174,15 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         content = f"mock:n={len(messages)} last={msg}"
                         finish_reason = "stop"
+                        extra = []
+                        if "temperature" in j:
+                            extra.append(f"temp={j.get('temperature')}")
+                        if "top_p" in j:
+                            extra.append(f"top_p={j.get('top_p')}")
+                        if "min_p" in j:
+                            extra.append(f"min_p={j.get('min_p')}")
+                        if extra:
+                            content += " " + " ".join(extra)
 
                 self._send(
                     200,

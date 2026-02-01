@@ -29,6 +29,10 @@ static std::string ToLowerAscii(std::string s) {
   return s;
 }
 
+static bool IsGlmFamilyModel(const std::string& model) {
+  return ToLowerAscii(model).find("glm") != std::string::npos;
+}
+
 static std::string NormalizePrefix(std::string p) {
   if (p.empty()) return {};
   if (p == "/") return {};
@@ -282,6 +286,29 @@ static std::string FakeModelOnce(const std::vector<ChatMessage>& messages) {
       break;
     }
   }
+
+  auto extract_uri_arg = [&](const std::string& text) -> std::optional<std::string> {
+    auto pos = text.find("uri=");
+    if (pos == std::string::npos) return std::nullopt;
+    pos += 4;
+    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) pos++;
+    if (pos >= text.size()) return std::nullopt;
+    char quote = 0;
+    if (text[pos] == '"' || text[pos] == '\'') {
+      quote = text[pos];
+      pos++;
+    }
+    size_t end = pos;
+    if (quote) {
+      end = text.find(quote, pos);
+      if (end == std::string::npos) return std::nullopt;
+    } else {
+      while (end < text.size() && !std::isspace(static_cast<unsigned char>(text[end]))) end++;
+    }
+    if (end <= pos) return std::nullopt;
+    return text.substr(pos, end - pos);
+  };
+
   if (last_system.find("You are a planner.") != std::string::npos) {
     if (last_user.find("bad_args") != std::string::npos) {
       return R"({"plan":[{"name":"ide.hover","arguments":{"uri":"file:///Users/acproject/workspace/cpp_projects/local-ai-runtime/src/main.cpp","line":"x","character":2}}]})";
@@ -299,6 +326,10 @@ static std::string FakeModelOnce(const std::vector<ChatMessage>& messages) {
       return R"({"plan":[{"name":"ide.definition","arguments":{"uri":"file:///Users/acproject/workspace/cpp_projects/local-ai-runtime/src/main.cpp","line":1,"character":2}}]})";
     }
     if (last_user.find("ide.diagnostics") != std::string::npos) {
+      if (auto uri = extract_uri_arg(last_user)) {
+        return std::string(R"({"plan":[{"name":"ide.diagnostics","arguments":{"uri":)") + nlohmann::json(*uri).dump() +
+               R"(}}]})";
+      }
       return R"({"plan":[{"name":"ide.diagnostics","arguments":{"uri":"file:///Users/acproject/workspace/cpp_projects/local-ai-runtime/src/main.cpp"}}]})";
     }
     if (last_user.find("lsp.hover") != std::string::npos) {
@@ -334,6 +365,10 @@ static std::string FakeModelOnce(const std::vector<ChatMessage>& messages) {
       return R"({"tool_calls":[{"id":"call_1","name":"ide.definition","arguments":{"uri":"file:///Users/acproject/workspace/cpp_projects/local-ai-runtime/src/main.cpp","line":1,"character":2}}]})";
     }
     if (last_user.find("ide.diagnostics") != std::string::npos) {
+      if (auto uri = extract_uri_arg(last_user)) {
+        return std::string(R"({"tool_calls":[{"id":"call_1","name":"ide.diagnostics","arguments":{"uri":)") +
+               nlohmann::json(*uri).dump() + R"(}}]})";
+      }
       return R"({"tool_calls":[{"id":"call_1","name":"ide.diagnostics","arguments":{"uri":"file:///Users/acproject/workspace/cpp_projects/local-ai-runtime/src/main.cpp"}}]})";
     }
     if (last_user.find("lsp.hover") != std::string::npos) {
@@ -463,6 +498,9 @@ static bool ValidateSchemaLoose(const nlohmann::json& schema, const nlohmann::js
 static std::string ChatOnceText(const std::string& model,
                                 const std::vector<ChatMessage>& messages,
                                 const std::optional<int>& max_tokens,
+                                const std::optional<float>& temperature,
+                                const std::optional<float>& top_p,
+                                const std::optional<float>& min_p,
                                 IProvider* provider,
                                 std::string* err) {
   if (model == "fake-tool") return FakeModelOnce(messages);
@@ -470,6 +508,9 @@ static std::string ChatOnceText(const std::string& model,
   req.model = model;
   req.stream = false;
   req.max_tokens = max_tokens;
+  req.temperature = temperature;
+  req.top_p = top_p;
+  req.min_p = min_p;
   req.messages = messages;
   auto resp = provider->ChatOnce(req, err);
   if (!resp) return {};
@@ -482,6 +523,9 @@ static ToolLoopResult RunPlanner(const std::string& model,
                                  const ToolRegistry& registry,
                                  IProvider* provider,
                                  const std::optional<int>& max_tokens,
+                                 const std::optional<float>& temperature,
+                                 const std::optional<float>& top_p,
+                                 const std::optional<float>& min_p,
                                  int max_plan_steps,
                                  int max_plan_rewrites,
                                  int max_tool_calls,
@@ -505,7 +549,7 @@ static ToolLoopResult RunPlanner(const std::string& model,
   std::string plan_text;
   int rewrites = 0;
   for (int attempt = 0; attempt <= max_plan_rewrites; attempt++) {
-    plan_text = ChatOnceText(model, plan_msgs, max_tokens, provider, err);
+    plan_text = ChatOnceText(model, plan_msgs, max_tokens, temperature, top_p, min_p, provider, err);
     if (plan_text.empty() && err && !err->empty()) {
       out.planner_failed = true;
       return out;
@@ -628,7 +672,7 @@ static ToolLoopResult RunPlanner(const std::string& model,
   final_msgs.push_back({"system", BuildPlannerFinalSystemPrompt()});
   for (const auto& m : exec_msgs) final_msgs.push_back(m);
 
-  auto final_text = ChatOnceText(model, final_msgs, max_tokens, provider, err);
+  auto final_text = ChatOnceText(model, final_msgs, max_tokens, temperature, top_p, min_p, provider, err);
   out.steps = 2;
   if (auto final = ExtractFinalFromAssistantJson(final_text)) {
     out.final_text = *final;
@@ -644,6 +688,9 @@ static ToolLoopResult RunToolLoop(const std::string& model,
                                   const ToolRegistry& registry,
                                   IProvider* provider,
                                   const std::optional<int>& max_tokens,
+                                  const std::optional<float>& temperature,
+                                  const std::optional<float>& top_p,
+                                  const std::optional<float>& min_p,
                                   int max_steps,
                                   int max_tool_calls,
                                   std::string* err) {
@@ -673,6 +720,9 @@ static ToolLoopResult RunToolLoop(const std::string& model,
       req.model = model;
       req.stream = false;
       req.max_tokens = max_tokens;
+      req.temperature = temperature;
+      req.top_p = top_p;
+      req.min_p = min_p;
       req.messages = msgs;
       auto resp = provider->ChatOnce(req, err);
       if (!resp) return out;
@@ -902,6 +952,12 @@ void OpenAiRouter::Register(httplib::Server* server) {
     } else if (j.contains("max_completion_tokens") && j["max_completion_tokens"].is_number_integer()) {
       max_tokens = j["max_completion_tokens"].get<int>();
     }
+    std::optional<float> temperature;
+    if (j.contains("temperature") && j["temperature"].is_number()) temperature = j["temperature"].get<float>();
+    std::optional<float> top_p;
+    if (j.contains("top_p") && j["top_p"].is_number()) top_p = j["top_p"].get<float>();
+    std::optional<float> min_p;
+    if (j.contains("min_p") && j["min_p"].is_number()) min_p = j["min_p"].get<float>();
 
     int max_steps = 6;
     if (j.contains("max_steps") && j["max_steps"].is_number_integer()) max_steps = j["max_steps"].get<int>();
@@ -956,6 +1012,11 @@ void OpenAiRouter::Register(httplib::Server* server) {
       LogProviderUse(resolved->provider_name, resolved->model);
     }
 
+    if (!allowed_tools.empty() && IsGlmFamilyModel(provider_model)) {
+      temperature = 0.7f;
+      top_p = 1.0f;
+    }
+
     if (!stream) {
       std::string err;
       ToolLoopResult loop;
@@ -963,14 +1024,15 @@ void OpenAiRouter::Register(httplib::Server* server) {
       if (!allowed_tools.empty()) {
         if (planner) {
           loop =
-              RunPlanner(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, max_plan_steps, max_plan_rewrites,
-                         max_tool_calls,
-                         &err);
+              RunPlanner(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_plan_steps,
+                         max_plan_rewrites, max_tool_calls, &err);
           if (loop.planner_failed) {
-            loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, max_steps, max_tool_calls, &err);
+            loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
+                               max_tool_calls, &err);
           }
         } else {
-          loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, max_steps, max_tool_calls, &err);
+          loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
+                             max_tool_calls, &err);
         }
       } else {
         if (model == "fake-tool") {
@@ -980,6 +1042,9 @@ void OpenAiRouter::Register(httplib::Server* server) {
           creq.model = provider_model;
           creq.stream = false;
           creq.max_tokens = max_tokens;
+          creq.temperature = temperature;
+          creq.top_p = top_p;
+          creq.min_p = min_p;
           creq.messages = full_messages;
           auto resp = provider->ChatOnce(creq, &err);
           if (!resp) return SendJson(&res, 502, MakeError(err.empty() ? "upstream error" : err, "api_error"));
@@ -1037,6 +1102,9 @@ void OpenAiRouter::Register(httplib::Server* server) {
       creq.model = provider_model;
       creq.stream = true;
       creq.max_tokens = max_tokens;
+      creq.temperature = temperature;
+      creq.top_p = top_p;
+      creq.min_p = min_p;
       creq.messages = full_messages;
 
       res.set_chunked_content_provider(
@@ -1137,13 +1205,15 @@ void OpenAiRouter::Register(httplib::Server* server) {
     if (!allowed_tools.empty()) {
       if (planner) {
         loop =
-            RunPlanner(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, max_plan_steps, max_plan_rewrites,
-                       max_tool_calls, &err);
+            RunPlanner(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_plan_steps,
+                       max_plan_rewrites, max_tool_calls, &err);
         if (loop.planner_failed) {
-          loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, max_steps, max_tool_calls, &err);
+          loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
+                             max_tool_calls, &err);
         }
       } else {
-        loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, max_steps, max_tool_calls, &err);
+        loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
+                           max_tool_calls, &err);
       }
     } else {
       loop.final_text = FakeModelOnce(full_messages);

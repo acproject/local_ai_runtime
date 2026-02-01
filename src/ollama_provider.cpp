@@ -17,6 +17,14 @@ static std::unique_ptr<httplib::Client> MakeClient(const HttpEndpoint& ep) {
   return cli;
 }
 
+static std::unique_ptr<httplib::Client> MakeQuickClient(const HttpEndpoint& ep) {
+  auto cli = std::make_unique<httplib::Client>(ep.host, ep.port);
+  cli->set_connection_timeout(0, 200000);
+  cli->set_read_timeout(0, 500000);
+  cli->set_write_timeout(0, 500000);
+  return cli;
+}
+
 static std::string JoinPath(const std::string& base, const std::string& path) {
   if (base.empty()) return path;
   if (base.back() == '/' && !path.empty() && path.front() == '/') return base + path.substr(1);
@@ -38,7 +46,7 @@ static void LogPs(httplib::Client& cli, const HttpEndpoint& endpoint, const std:
 OllamaProvider::OllamaProvider(HttpEndpoint endpoint) : endpoint_(std::move(endpoint)) {}
 
 void OllamaProvider::Start() {
-  auto cli = MakeClient(endpoint_);
+  auto cli = MakeQuickClient(endpoint_);
   LogPs(*cli, endpoint_, "start");
 }
 
@@ -66,7 +74,7 @@ void OllamaProvider::Stop() {
 }
 
 std::optional<nlohmann::json> OllamaProvider::GetPs(std::string* err) {
-  auto cli = MakeClient(endpoint_);
+  auto cli = MakeQuickClient(endpoint_);
   auto res = cli->Get(JoinPath(endpoint_.base_path, "/api/ps"));
   if (!res) {
     if (err) *err = "ollama: /api/ps connect failed";
@@ -89,7 +97,7 @@ std::string OllamaProvider::Name() const {
 }
 
 std::vector<ModelInfo> OllamaProvider::ListModels(std::string* err) {
-  auto cli = MakeClient(endpoint_);
+  auto cli = MakeQuickClient(endpoint_);
   auto res = cli->Get(JoinPath(endpoint_.base_path, "/api/tags"));
   if (!res) {
     if (err) *err = "ollama: failed to connect";

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <nlohmann/json.hpp>
 #include <random>
 #include <sstream>
@@ -47,7 +48,7 @@ namespace {
 class FileSessionStore : public SessionStore {
  public:
   FileSessionStore(std::string path, std::string store_namespace)
-      : path_(std::move(path)), store_namespace_(std::move(store_namespace)) {
+      : path_(NormalizePath(std::move(path))), store_namespace_(std::move(store_namespace)) {
     LoadAll();
   }
   std::optional<Session> Load(const std::string& session_id) override {
@@ -64,6 +65,31 @@ class FileSessionStore : public SessionStore {
   std::string path_;
   std::string store_namespace_;
   std::unordered_map<std::string, Session> map_;
+
+  static std::string NormalizePath(std::string path) {
+    if (path.empty()) return {};
+    std::filesystem::path p(path);
+    const std::string s = p.string();
+    if (!s.empty()) {
+      const char last = s.back();
+      if (last == '/' || last == '\\') {
+        p /= "sessions.json";
+        return p.string();
+      }
+    }
+    std::error_code ec;
+    if (std::filesystem::exists(p, ec) && std::filesystem::is_directory(p, ec)) {
+      p /= "sessions.json";
+      return p.string();
+    }
+    const auto ext = p.extension().string();
+    const auto fname = p.filename().string();
+    if (ext.empty() && fname.find('.', 1) == std::string::npos) {
+      p /= "sessions.json";
+      return p.string();
+    }
+    return path;
+  }
 
   std::string MakeKey(const std::string& session_id) const {
     if (store_namespace_.empty()) return session_id;
@@ -176,12 +202,18 @@ class FileSessionStore : public SessionStore {
     tmp += ".tmp";
     {
       std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-      if (!out) return;
+      if (!out) {
+        std::cout << "[session-store] file open failed path=" << tmp.string() << "\n";
+        return;
+      }
       out << Snapshot().dump();
     }
     std::filesystem::remove(path, ec);
     std::filesystem::rename(tmp, path, ec);
-    if (ec) std::filesystem::remove(tmp, ec);
+    if (ec) {
+      std::cout << "[session-store] rename failed tmp=" << tmp.string() << " path=" << path.string() << " ec=" << ec.message() << "\n";
+      std::filesystem::remove(tmp, ec);
+    }
   }
 };
 
