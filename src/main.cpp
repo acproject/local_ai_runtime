@@ -44,6 +44,51 @@ static std::string ToLower(std::string s) {
   return s;
 }
 
+static std::string TruncateForLog(std::string s, size_t max_chars) {
+  if (max_chars == 0) return {};
+  if (s.size() <= max_chars) return s;
+  constexpr const char* kSuffix = "...(truncated)";
+  if (max_chars <= std::strlen(kSuffix)) return std::string(kSuffix).substr(0, max_chars);
+  s.resize(max_chars - std::strlen(kSuffix));
+  s += kSuffix;
+  return s;
+}
+
+static std::string SanitizeJsonForLog(const nlohmann::json& body) {
+  if (body.is_null()) return "null";
+  if (!body.is_object()) return body.dump();
+  auto j = body;
+  for (const auto& key : {"api_key", "api-key", "authorization", "apiKey"}) {
+    if (j.contains(key)) j.erase(key);
+  }
+  if (j.contains("headers") && j["headers"].is_object()) {
+    auto& h = j["headers"];
+    for (const auto& key : {"authorization", "proxy-authorization", "api-key", "api_key", "x-api-key"}) {
+      if (h.contains(key)) h.erase(key);
+    }
+  }
+  return j.dump();
+}
+
+static void LogMcpCall(const std::string& tool_call_id,
+                       const std::string& exposed_name,
+                       const std::string& remote_name,
+                       const nlohmann::json& arguments) {
+  std::cout << "[mcp-call] id=" << tool_call_id << " exposed=" << exposed_name << " remote=" << remote_name
+            << " arguments=" << TruncateForLog(SanitizeJsonForLog(arguments), 2000) << "\n";
+}
+
+static void LogMcpResult(const std::string& tool_call_id,
+                         const std::string& exposed_name,
+                         const std::string& remote_name,
+                         bool ok,
+                         const std::string& error,
+                         const nlohmann::json& result) {
+  std::cout << "[mcp-result] id=" << tool_call_id << " exposed=" << exposed_name << " remote=" << remote_name
+            << " ok=" << (ok ? 1 : 0) << " error=" << (error.empty() ? "-" : error)
+            << " result=" << TruncateForLog(SanitizeJsonForLog(result), 2000) << "\n";
+}
+
 static std::vector<std::string> SplitLines(const std::string& text) {
   std::vector<std::string> out;
   std::istringstream iss(text);
@@ -347,15 +392,18 @@ int main() {
           runtime::ToolResult r;
           r.tool_call_id = tool_call_id;
           r.name = exposed_name;
+          LogMcpCall(tool_call_id, exposed_name, remote_name, arguments);
           auto result = mcp->CallTool(remote_name, arguments, &call_err);
           if (!result) {
             r.ok = false;
             r.error = call_err.empty() ? "mcp: call failed" : call_err;
             r.result = {{"ok", false}, {"error", r.error}};
+            LogMcpResult(tool_call_id, exposed_name, remote_name, false, r.error, r.result);
             return r;
           }
           r.result = *result;
           if (result->contains("isError") && (*result)["isError"].is_boolean()) r.ok = !(*result)["isError"].get<bool>();
+          LogMcpResult(tool_call_id, exposed_name, remote_name, r.ok, r.error, r.result);
           return r;
         });
         out["registered"] = out["registered"].get<int>() + 1;
@@ -421,15 +469,18 @@ int main() {
         }
         nlohmann::json args;
         args["path"] = norm;
+        LogMcpCall(tool_call_id, schema.name, "fs.read_file", args);
         auto r = call_any_mcp("fs.read_file", args, &err);
         if (!r) {
           tr.ok = false;
           tr.error = err.empty() ? "mcp: call failed" : err;
           tr.result = {{"ok", false}, {"error", tr.error}};
+          LogMcpResult(tool_call_id, schema.name, "fs.read_file", false, tr.error, tr.result);
           return tr;
         }
         tr.result = *r;
         if (r->contains("isError") && (*r)["isError"].is_boolean()) tr.ok = !(*r)["isError"].get<bool>();
+        LogMcpResult(tool_call_id, schema.name, "fs.read_file", tr.ok, tr.error, tr.result);
         return tr;
       });
     }
@@ -472,15 +523,18 @@ int main() {
           args["path"] = cfg.workspace_root;
         }
         std::string err;
+        LogMcpCall(tool_call_id, schema.name, "fs.search", args);
         auto r = call_any_mcp("fs.search", args, &err);
         if (!r) {
           tr.ok = false;
           tr.error = err.empty() ? "mcp: call failed" : err;
           tr.result = {{"ok", false}, {"error", tr.error}};
+          LogMcpResult(tool_call_id, schema.name, "fs.search", false, tr.error, tr.result);
           return tr;
         }
         tr.result = *r;
         if (r->contains("isError") && (*r)["isError"].is_boolean()) tr.ok = !(*r)["isError"].get<bool>();
+        LogMcpResult(tool_call_id, schema.name, "fs.search", tr.ok, tr.error, tr.result);
         return tr;
       });
     }
@@ -511,15 +565,18 @@ int main() {
         }
         nlohmann::json args;
         args["uri"] = make_file_uri(norm);
+        LogMcpCall(tool_call_id, schema.name, "lsp.diagnostics", args);
         auto r = call_any_mcp("lsp.diagnostics", args, &err);
         if (!r) {
           tr.ok = false;
           tr.error = err.empty() ? "mcp: call failed" : err;
           tr.result = {{"ok", false}, {"error", tr.error}};
+          LogMcpResult(tool_call_id, schema.name, "lsp.diagnostics", false, tr.error, tr.result);
           return tr;
         }
         tr.result = *r;
         if (r->contains("isError") && (*r)["isError"].is_boolean()) tr.ok = !(*r)["isError"].get<bool>();
+        LogMcpResult(tool_call_id, schema.name, "lsp.diagnostics", tr.ok, tr.error, tr.result);
         return tr;
       });
     }
@@ -562,15 +619,18 @@ int main() {
         args["uri"] = make_file_uri(norm);
         args["line"] = arguments["line"];
         args["character"] = arguments["character"];
+        LogMcpCall(tool_call_id, schema.name, "lsp.hover", args);
         auto r = call_any_mcp("lsp.hover", args, &err);
         if (!r) {
           tr.ok = false;
           tr.error = err.empty() ? "mcp: call failed" : err;
           tr.result = {{"ok", false}, {"error", tr.error}};
+          LogMcpResult(tool_call_id, schema.name, "lsp.hover", false, tr.error, tr.result);
           return tr;
         }
         tr.result = *r;
         if (r->contains("isError") && (*r)["isError"].is_boolean()) tr.ok = !(*r)["isError"].get<bool>();
+        LogMcpResult(tool_call_id, schema.name, "lsp.hover", tr.ok, tr.error, tr.result);
         return tr;
       });
     }
@@ -613,15 +673,18 @@ int main() {
         args["uri"] = make_file_uri(norm);
         args["line"] = arguments["line"];
         args["character"] = arguments["character"];
+        LogMcpCall(tool_call_id, schema.name, "lsp.definition", args);
         auto r = call_any_mcp("lsp.definition", args, &err);
         if (!r) {
           tr.ok = false;
           tr.error = err.empty() ? "mcp: call failed" : err;
           tr.result = {{"ok", false}, {"error", tr.error}};
+          LogMcpResult(tool_call_id, schema.name, "lsp.definition", false, tr.error, tr.result);
           return tr;
         }
         tr.result = *r;
         if (r->contains("isError") && (*r)["isError"].is_boolean()) tr.ok = !(*r)["isError"].get<bool>();
+        LogMcpResult(tool_call_id, schema.name, "lsp.definition", tr.ok, tr.error, tr.result);
         return tr;
       });
     }

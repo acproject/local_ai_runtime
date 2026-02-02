@@ -159,5 +159,5 @@ curl -s http://127.0.0.1:18080/v1/responses ^
 
 ### 使用Python测试
 ```ps
-python .\tools\chat_client.py --base-url http://127.0.0.1:18081 --stream --timeout-s 600
+python .\tools\chat_client.py --base-url http://127.0.0.1:18081 --tools lsp --stream --timeout-s 600
 ```
