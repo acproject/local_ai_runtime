@@ -1,6 +1,7 @@
 #include "session_manager.hpp"
 
 #include <chrono>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -8,6 +9,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <cstring>
 #include <vector>
 
 #ifdef _WIN32
@@ -223,9 +225,17 @@ class MiniMemoryStore : public SessionStore {
       : ep_(ep), password_(password), db_(db), store_namespace_(std::move(store_namespace)) {}
   std::optional<Session> Load(const std::string& session_id) override {
     auto conn = Connect();
-    if (!conn) return std::nullopt;
-    if (!AuthAndSelect(*conn)) return std::nullopt;
-    auto val = SendGet(*conn, MakeKey(session_id));
+    if (!conn) {
+      std::cout << "[session-store] minimemory connect failed host=" << ep_.host << " port=" << ep_.port << "\n";
+      return std::nullopt;
+    }
+    if (!AuthAndSelect(*conn)) {
+      std::cout << "[session-store] minimemory auth/select failed host=" << ep_.host << " port=" << ep_.port << " db=" << db_ << "\n";
+      Close(*conn);
+      return std::nullopt;
+    }
+    std::string io_err;
+    auto val = SendGet(*conn, MakeKey(session_id), &io_err);
     Close(*conn);
     if (!val.has_value()) return std::nullopt;
     nlohmann::json j = nlohmann::json::parse(*val, nullptr, false);
@@ -265,8 +275,12 @@ class MiniMemoryStore : public SessionStore {
 
   void Save(const Session& s) override {
     auto conn = Connect();
-    if (!conn) return;
+    if (!conn) {
+      std::cout << "[session-store] minimemory connect failed host=" << ep_.host << " port=" << ep_.port << "\n";
+      return;
+    }
     if (!AuthAndSelect(*conn)) {
+      std::cout << "[session-store] minimemory auth/select failed host=" << ep_.host << " port=" << ep_.port << " db=" << db_ << "\n";
       Close(*conn);
       return;
     }
@@ -282,9 +296,13 @@ class MiniMemoryStore : public SessionStore {
       if (t.output_text.has_value()) tj["output_text"] = *t.output_text; else tj["output_text"] = nullptr;
       j["turns"].push_back(std::move(tj));
     }
-    auto ok = SendSet(*conn, MakeKey(s.session_id), j.dump());
+    std::string io_err;
+    auto ok = SendSet(*conn, MakeKey(s.session_id), j.dump(), &io_err);
     Close(*conn);
-    (void)ok;
+    if (!ok) {
+      std::cout << "[session-store] minimemory set failed host=" << ep_.host << " port=" << ep_.port
+                << " key=" << MakeKey(s.session_id) << " err=" << io_err << "\n";
+    }
   }
 
  private:
@@ -300,6 +318,21 @@ class MiniMemoryStore : public SessionStore {
     int fd = -1;
 #endif
   };
+
+  std::optional<in_addr> ResolveIpv4(const std::string& host) {
+    in_addr out{};
+    if (inet_pton(AF_INET, host.c_str(), &out) > 0) return out;
+
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) return std::nullopt;
+    auto* sin = reinterpret_cast<sockaddr_in*>(res->ai_addr);
+    out = sin->sin_addr;
+    freeaddrinfo(res);
+    return out;
+  }
 
   std::optional<Conn> Connect() {
 #ifdef _WIN32
@@ -325,12 +358,12 @@ class MiniMemoryStore : public SessionStore {
 
     {
 #ifdef _WIN32
-      DWORD timeout_ms = 1000;
+      DWORD timeout_ms = 5000;
       setsockopt(c.fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
       setsockopt(c.fd, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
 #else
       timeval tv{};
-      tv.tv_sec = 1;
+      tv.tv_sec = 5;
       tv.tv_usec = 0;
       setsockopt(c.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
       setsockopt(c.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -340,10 +373,12 @@ class MiniMemoryStore : public SessionStore {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(ep_.port);
-    if (inet_pton(AF_INET, ep_.host.c_str(), &addr.sin_addr) <= 0) {
+    auto ip = ResolveIpv4(ep_.host);
+    if (!ip) {
       Close(c);
       return std::nullopt;
     }
+    addr.sin_addr = *ip;
     if (
 #ifdef _WIN32
         ::connect(c.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR
@@ -373,15 +408,29 @@ class MiniMemoryStore : public SessionStore {
         ;
   }
 
-  bool SendRaw(Conn& c, const std::string& cmd, std::string* out_resp) {
+  std::string LastSockErr() const {
+#ifdef _WIN32
+    return std::to_string(WSAGetLastError());
+#else
+    return std::to_string(errno) + ":" + std::strerror(errno);
+#endif
+  }
+
+  bool SendRaw(Conn& c, const std::string& cmd, std::string* out_resp, std::string* out_err) {
     size_t sent = 0;
     while (sent < cmd.size()) {
 #ifdef _WIN32
       int n = send(c.fd, cmd.data() + sent, static_cast<int>(cmd.size() - sent), 0);
-      if (n == SOCKET_ERROR || n <= 0) return false;
+      if (n == SOCKET_ERROR || n <= 0) {
+        if (out_err) *out_err = LastSockErr();
+        return false;
+      }
 #else
       ssize_t n = send(c.fd, cmd.data() + sent, cmd.size() - sent, 0);
-      if (n <= 0) return false;
+      if (n <= 0) {
+        if (out_err) *out_err = LastSockErr();
+        return false;
+      }
 #endif
       sent += static_cast<size_t>(n);
     }
@@ -412,10 +461,16 @@ class MiniMemoryStore : public SessionStore {
 #else
       ssize_t n = recv(c.fd, buf, sizeof(buf), 0);
 #endif
-      if (n <= 0) return false;
+      if (n <= 0) {
+        if (out_err) *out_err = LastSockErr();
+        return false;
+      }
       resp.append(buf, static_cast<size_t>(n));
       if (is_resp_complete(resp)) break;
-      if (resp.size() > 2 * 1024 * 1024) return false;
+      if (resp.size() > 2 * 1024 * 1024) {
+        if (out_err) *out_err = "response_too_large";
+        return false;
+      }
     }
     if (out_resp) *out_resp = std::move(resp);
     return true;
@@ -424,18 +479,30 @@ class MiniMemoryStore : public SessionStore {
   bool AuthAndSelect(Conn& c) {
     if (!password_.empty()) {
       std::string resp;
-      if (!SendRaw(c, Resp({"AUTH", password_}), &resp)) return false;
+      std::string err;
+      if (!SendRaw(c, Resp({"AUTH", password_}), &resp, &err)) return false;
+      if (!resp.empty() && resp[0] == '-') return false;
     }
     if (db_ != 0) {
       std::string resp;
-      if (!SendRaw(c, Resp({"SELECT", std::to_string(db_)}), &resp)) return false;
+      std::string err;
+      if (!SendRaw(c, Resp({"SELECT", std::to_string(db_)}), &resp, &err)) return false;
+      if (!resp.empty() && resp[0] == '-') return false;
     }
     return true;
   }
 
-  std::optional<std::string> SendGet(Conn& c, const std::string& key) {
+  std::optional<std::string> SendGet(Conn& c, const std::string& key, std::string* out_err) {
     std::string resp;
-    if (!SendRaw(c, Resp({"GET", key}), &resp)) return std::nullopt;
+    std::string err;
+    if (!SendRaw(c, Resp({"GET", key}), &resp, &err)) {
+      if (out_err) *out_err = err;
+      return std::nullopt;
+    }
+    if (!resp.empty() && resp[0] == '-') {
+      if (out_err) *out_err = resp;
+      return std::nullopt;
+    }
     if (resp.rfind("$", 0) == 0) {
       auto crlf = resp.find("\r\n");
       if (crlf == std::string::npos) return std::nullopt;
@@ -448,9 +515,18 @@ class MiniMemoryStore : public SessionStore {
     return std::nullopt;
   }
 
-  bool SendSet(Conn& c, const std::string& key, const std::string& value) {
+  bool SendSet(Conn& c, const std::string& key, const std::string& value, std::string* out_err) {
     std::string resp;
-    return SendRaw(c, Resp({"SET", key, value}), &resp);
+    std::string err;
+    if (!SendRaw(c, Resp({"SET", key, value}), &resp, &err)) {
+      if (out_err) *out_err = err;
+      return false;
+    }
+    if (!resp.empty() && resp[0] == '-') {
+      if (out_err) *out_err = resp;
+      return false;
+    }
+    return true;
   }
 
   std::string MakeKey(const std::string& session_id) const {
@@ -476,11 +552,7 @@ class MiniMemoryStore : public SessionStore {
 SessionManager::SessionManager(SessionStoreConfig cfg) {
   reset_on_boot_ = cfg.reset_on_boot;
   std::string store_namespace = cfg.store_namespace;
-  if (reset_on_boot_ && cfg.type != "memory") {
-    store_namespace = NewId("boot");
-  } else if (store_namespace.empty() && cfg.type != "memory") {
-    store_namespace = NewId("boot");
-  }
+  if (cfg.type != "memory" && store_namespace.empty()) store_namespace = NewId("boot");
   if (cfg.type == "file" && !cfg.file_path.empty()) {
     store_ = std::make_unique<FileSessionStore>(cfg.file_path, store_namespace);
   } else if (cfg.type == "minimemory" || cfg.type == "redis") {

@@ -151,6 +151,27 @@ class Handler(BaseHTTPRequestHandler):
                         last = messages[-1]
                         if isinstance(last, dict):
                             msg = str(last.get("content") or "")
+                    if isinstance(msg, str) and msg.startswith("TOOL_RESULT "):
+                        content = '{"opencode":{"final":"done"}}'
+                        finish_reason = "stop"
+                        self._send(
+                            200,
+                            {
+                                "id": f"chatcmpl-{int(time.time())}",
+                                "object": "chat.completion",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "message": {"role": "assistant", "content": content},
+                                        "finish_reason": finish_reason,
+                                    }
+                                ],
+                                "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
+                            },
+                        )
+                        return
                     max_req = j.get("max_tokens") or j.get("max_completion_tokens")
                     max_req_i = None
                     try:
@@ -174,6 +195,12 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         content = f"mock:n={len(messages)} last={msg}"
                         finish_reason = "stop"
+                        if isinstance(msg, str) and "mock-toolcall:tag" in msg:
+                            content = '<tool_call>ide.search</tool_call><arg_value>{"query":"OpenAiRouter","path":"src","max_results":3}</arg_value>'
+                        if isinstance(msg, str) and "mock-toolcall:weirdtag" in msg:
+                            content = '<tool_call>ide.search</arg_value>{"query":"OpenAiRouter","path":"src","max_results":3}</arg_value>'
+                        if isinstance(msg, str) and "mock-toolcall:opencode" in msg:
+                            content = '{"opencode":{"tool_calls":[{"name":"ide.search","arguments":{"query":"OpenAiRouter","path":"src","max_results":3}}]}}'
                         extra = []
                         if "temperature" in j:
                             extra.append(f"temp={j.get('temperature')}")

@@ -1,5 +1,7 @@
 #include "config.hpp"
+#if LOCAL_AI_RUNTIME_WITH_LLAMA_CPP
 #include "llama_cpp_provider.hpp"
+#endif
 #include "mcp_client.hpp"
 #include "openai_compatible_http_provider.hpp"
 #include "ollama_provider.hpp"
@@ -163,7 +165,9 @@ int main() {
   store_cfg.reset_on_boot = cfg.session_store_reset_on_boot;
   runtime::SessionManager sessions(store_cfg);
   runtime::ProviderRegistry providers(cfg.default_provider);
+#if LOCAL_AI_RUNTIME_WITH_LLAMA_CPP
   providers.Register(std::make_unique<runtime::LlamaCppProvider>(cfg.llama_cpp_model_path));
+#endif
   providers.Register(std::make_unique<runtime::OllamaProvider>(cfg.ollama));
   if (cfg.mnn_enabled) providers.Register(std::make_unique<runtime::OpenAiCompatibleHttpProvider>("mnn", cfg.mnn));
   if (cfg.lmdeploy_enabled) providers.Register(std::make_unique<runtime::OpenAiCompatibleHttpProvider>("lmdeploy", cfg.lmdeploy));

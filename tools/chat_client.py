@@ -27,6 +27,33 @@ def _no_proxy_env() -> None:
             os.environ.pop(k, None)
 
 
+def _build_tools(preset: str) -> List[Dict[str, Any]]:
+    p = (preset or "").strip().lower()
+    if p in ("", "none", "off", "0", "false"):
+        return []
+    if p in ("lsp", "ide", "default"):
+        return [
+            {"type": "function", "function": {"name": "ide.diagnostics"}},
+            {"type": "function", "function": {"name": "ide.hover"}},
+            {"type": "function", "function": {"name": "ide.definition"}},
+            {"type": "function", "function": {"name": "ide.read_file"}},
+            {"type": "function", "function": {"name": "ide.search"}},
+        ]
+    if p == "all":
+        return [
+            {"type": "function", "function": {"name": "ide.diagnostics"}},
+            {"type": "function", "function": {"name": "ide.hover"}},
+            {"type": "function", "function": {"name": "ide.definition"}},
+            {"type": "function", "function": {"name": "ide.read_file"}},
+            {"type": "function", "function": {"name": "ide.search"}},
+            {"type": "function", "function": {"name": "runtime.infer_task_status"}},
+        ]
+    tools: List[Dict[str, Any]] = []
+    for name in [x.strip() for x in p.split(",") if x.strip()]:
+        tools.append({"type": "function", "function": {"name": name}})
+    return tools
+
+
 def _http_json(
     method: str,
     url: str,
@@ -102,7 +129,6 @@ def _sse_chat(
     if resp.status < 200 or resp.status >= 300:
         raw = resp.read().decode("utf-8", errors="replace")
         conn.close()
-        raise RuntimeError(f"chat stream failed: http {resp.status}: {raw[:500]}")
 
     acc = ""
     finish_reason: Optional[str] = None
@@ -157,6 +183,12 @@ class ChatState:
     stream: bool
     max_tokens: int
     timeout_s: float
+    use_server_history: bool
+    tool_choice: str
+    tools_preset: str
+    max_steps: int
+    max_tool_calls: int
+    trace: bool
     messages: List[Dict[str, str]]
 
     def headers(self) -> Dict[str, str]:
@@ -181,9 +213,24 @@ def _send_one(state: ChatState, role: str, content: str) -> str:
     state.messages.append({"role": role, "content": _clean_text_for_json(content)})
     payload: Dict[str, Any] = {
         "model": state.model,
+        "session_id": state.session_id,
+        "use_server_history": bool(state.use_server_history),
         "messages": state.messages,
         "max_tokens": int(state.max_tokens),
     }
+    tools = _build_tools(state.tools_preset)
+    if tools:
+        payload["tool_choice"] = state.tool_choice or "auto"
+        payload["tools"] = tools
+        if state.max_steps > 0:
+            payload["max_steps"] = int(state.max_steps)
+        if state.max_tool_calls > 0:
+            payload["max_tool_calls"] = int(state.max_tool_calls)
+    else:
+        payload["tool_choice"] = "none"
+    if state.trace:
+        payload["trace"] = True
+
     if state.stream:
         payload["stream"] = True
         text, fr, done, next_session_id = _sse_chat(state.base_url, payload, timeout_s=state.timeout_s, headers=state.headers())
@@ -202,6 +249,7 @@ def _send_one(state: ChatState, role: str, content: str) -> str:
     next_session_id = resp_headers.get("x-session-id") or resp_headers.get("X-Session-Id")
     if next_session_id and next_session_id != state.session_id:
         state.session_id = next_session_id
+    runtime_trace = resp_headers.get("x-runtime-trace") or resp_headers.get("X-Runtime-Trace")
     if st < 200 or st >= 300:
         raise RuntimeError(f"chat failed: http {st}: {body[:500]}")
     j = json.loads(body)
@@ -212,6 +260,18 @@ def _send_one(state: ChatState, role: str, content: str) -> str:
             msg = choices[0].get("message")
             if isinstance(msg, dict) and isinstance(msg.get("content"), str):
                 txt = msg["content"]
+    if state.trace and runtime_trace:
+        try:
+            trace_obj = json.loads(runtime_trace)
+            sys.stdout.write("\n")
+            sys.stdout.write(json.dumps(trace_obj, ensure_ascii=False, indent=2))
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        except Exception:
+            sys.stdout.write("\n")
+            sys.stdout.write(runtime_trace)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
     state.messages.append({"role": "assistant", "content": _clean_text_for_json(txt)})
     return txt
 
@@ -227,7 +287,18 @@ def _print_help() -> None:
                 "  /system <text>             设置 system prompt（会写入历史首条）",
                 "  /stream on|off             打开/关闭流式输出",
                 "  /max_tokens <n>            设置 max_tokens",
+                "  /use_server_history on|off 设置 use_server_history",
                 "  /session <id>              切换 session_id（不会清空本地历史）",
+                "  /tools none|lsp|all|csv     设置 tools（csv 示例：ide.search,ide.read_file）",
+                "  /tool_choice auto|none      设置 tool_choice",
+                "  /max_steps <n>              设置 max_steps（工具循环步数）",
+                "  /max_tool_calls <n>         设置 max_tool_calls（工具调用上限）",
+                "  /trace on|off               输出 x-runtime-trace（非 stream）",
+                "  /lsp_diag <path>            触发 ide.diagnostics",
+                "  /lsp_hover <path> <l> <c>   触发 ide.hover",
+                "  /lsp_def <path> <l> <c>     触发 ide.definition",
+                "  /read <path>                触发 ide.read_file",
+                "  /search <query> [path]      触发 ide.search",
                 "  /clear                     清空本地对话历史（保留 system）",
                 "  /msg <role> <text>         以指定 role 发送一条消息（role: user/system/assistant）",
                 "  /exit                      退出",
@@ -245,6 +316,13 @@ def _parse_on_off(s: str) -> Optional[bool]:
     if v in ("0", "false", "no", "n", "off"):
         return False
     return None
+
+
+def _safe_int(s: str) -> int:
+    try:
+        return int(s.strip())
+    except Exception:
+        return 0
 
 
 def _interactive(state: ChatState) -> None:
@@ -308,6 +386,14 @@ def _interactive(state: ChatState) -> None:
                 state.stream = b
                 print(f"stream={1 if state.stream else 0}")
                 continue
+            if cmd == "/use_server_history":
+                b = _parse_on_off(arg1)
+                if b is None:
+                    print("用法：/use_server_history on|off")
+                    continue
+                state.use_server_history = b
+                print(f"use_server_history={1 if state.use_server_history else 0}")
+                continue
             if cmd == "/max_tokens":
                 try:
                     n = int(arg1)
@@ -325,6 +411,143 @@ def _interactive(state: ChatState) -> None:
                     continue
                 state.session_id = arg1.strip()
                 print(f"session_id={state.session_id}")
+                continue
+            if cmd == "/tools":
+                state.tools_preset = (arg1 + (" " + arg2 if arg2 else "")).strip() or "lsp"
+                tools = _build_tools(state.tools_preset)
+                print(f"tools={len(tools)} preset={state.tools_preset}")
+                continue
+            if cmd == "/tool_choice":
+                v = arg1.strip().lower()
+                if v not in ("auto", "none"):
+                    print("用法：/tool_choice auto|none")
+                    continue
+                state.tool_choice = v
+                print(f"tool_choice={state.tool_choice}")
+                continue
+            if cmd == "/max_steps":
+                n = _safe_int(arg1)
+                if n <= 0:
+                    print("用法：/max_steps <正整数>")
+                    continue
+                state.max_steps = n
+                print(f"max_steps={state.max_steps}")
+                continue
+            if cmd == "/max_tool_calls":
+                n = _safe_int(arg1)
+                if n <= 0:
+                    print("用法：/max_tool_calls <正整数>")
+                    continue
+                state.max_tool_calls = n
+                print(f"max_tool_calls={state.max_tool_calls}")
+                continue
+            if cmd == "/trace":
+                b = _parse_on_off(arg1)
+                if b is None:
+                    print("用法：/trace on|off")
+                    continue
+                state.trace = b
+                print(f"trace={1 if state.trace else 0}")
+                continue
+            if cmd == "/lsp_diag":
+                path = (arg1 + (" " + arg2 if arg2 else "")).strip()
+                if not path:
+                    print("用法：/lsp_diag <path>")
+                    continue
+                prompt = f"请调用 ide.diagnostics，arguments={{\"uri\":{json.dumps(path, ensure_ascii=False)}}}，并给出可读的结果摘要。"
+                print("")
+                try:
+                    out = _send_one(state, "user", prompt)
+                except Exception as e:
+                    print(f"\n请求失败：{e}")
+                    continue
+                if not state.stream:
+                    print(out)
+                print("")
+                continue
+            if cmd == "/lsp_hover":
+                if not arg2:
+                    print("用法：/lsp_hover <path> <line> <character>")
+                    continue
+                parts2 = arg2.strip().split()
+                if len(parts2) != 2:
+                    print("用法：/lsp_hover <path> <line> <character>")
+                    continue
+                path = arg1.strip()
+                line = _safe_int(parts2[0])
+                ch = _safe_int(parts2[1])
+                prompt = (
+                    f"请调用 ide.hover，arguments={{\"uri\":{json.dumps(path, ensure_ascii=False)},\"line\":{line},\"character\":{ch}}}，并返回 hover 内容。"
+                )
+                print("")
+                try:
+                    out = _send_one(state, "user", prompt)
+                except Exception as e:
+                    print(f"\n请求失败：{e}")
+                    continue
+                if not state.stream:
+                    print(out)
+                print("")
+                continue
+            if cmd == "/lsp_def":
+                if not arg2:
+                    print("用法：/lsp_def <path> <line> <character>")
+                    continue
+                parts2 = arg2.strip().split()
+                if len(parts2) != 2:
+                    print("用法：/lsp_def <path> <line> <character>")
+                    continue
+                path = arg1.strip()
+                line = _safe_int(parts2[0])
+                ch = _safe_int(parts2[1])
+                prompt = (
+                    f"请调用 ide.definition，arguments={{\"uri\":{json.dumps(path, ensure_ascii=False)},\"line\":{line},\"character\":{ch}}}，并返回定义位置。"
+                )
+                print("")
+                try:
+                    out = _send_one(state, "user", prompt)
+                except Exception as e:
+                    print(f"\n请求失败：{e}")
+                    continue
+                if not state.stream:
+                    print(out)
+                print("")
+                continue
+            if cmd == "/read":
+                path = (arg1 + (" " + arg2 if arg2 else "")).strip()
+                if not path:
+                    print("用法：/read <path>")
+                    continue
+                prompt = f"请调用 ide.read_file，arguments={{\"path\":{json.dumps(path, ensure_ascii=False)}}}，并返回内容摘要。"
+                print("")
+                try:
+                    out = _send_one(state, "user", prompt)
+                except Exception as e:
+                    print(f"\n请求失败：{e}")
+                    continue
+                if not state.stream:
+                    print(out)
+                print("")
+                continue
+            if cmd == "/search":
+                q = arg1.strip()
+                p = arg2.strip()
+                if not q:
+                    print("用法：/search <query> [path]")
+                    continue
+                if p:
+                    prompt = f"请调用 ide.search，arguments={{\"query\":{json.dumps(q, ensure_ascii=False)},\"path\":{json.dumps(p, ensure_ascii=False)},\"max_results\":20}}，并总结结果。"
+                else:
+                    prompt = f"请调用 ide.search，arguments={{\"query\":{json.dumps(q, ensure_ascii=False)},\"max_results\":20}}，并总结结果。"
+                print("")
+                try:
+                    out = _send_one(state, "user", prompt)
+                except Exception as e:
+                    print(f"\n请求失败：{e}")
+                    continue
+                if not state.stream:
+                    print(out)
+                print("")
                 continue
             if cmd == "/clear":
                 state.reset_history()
@@ -372,6 +595,12 @@ def main() -> int:
     ap.add_argument("--system", default="")
     ap.add_argument("--stream", action="store_true")
     ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--use-server-history", action="store_true")
+    ap.add_argument("--tools", default="none")
+    ap.add_argument("--tool-choice", default="auto")
+    ap.add_argument("--max-steps", type=int, default=6)
+    ap.add_argument("--max-tool-calls", type=int, default=16)
+    ap.add_argument("--trace", action="store_true")
     ap.add_argument("--timeout-s", type=float, default=300.0)
     ap.add_argument("--once", default="")
     args = ap.parse_args()
@@ -394,6 +623,12 @@ def main() -> int:
         stream=bool(args.stream),
         max_tokens=int(args.max_tokens),
         timeout_s=float(args.timeout_s),
+        use_server_history=bool(args.use_server_history),
+        tool_choice=str(args.tool_choice or "auto"),
+        tools_preset=str(args.tools or "none"),
+        max_steps=int(args.max_steps),
+        max_tool_calls=int(args.max_tool_calls),
+        trace=bool(args.trace),
         messages=[],
     )
     state.reset_history()
@@ -403,6 +638,12 @@ def main() -> int:
     print(f"model={state.model}")
     print(f"stream={1 if state.stream else 0}")
     print(f"max_tokens={state.max_tokens}")
+    print(f"use_server_history={1 if state.use_server_history else 0}")
+    print(f"tools_preset={state.tools_preset}")
+    print(f"tool_choice={state.tool_choice}")
+    print(f"max_steps={state.max_steps}")
+    print(f"max_tool_calls={state.max_tool_calls}")
+    print(f"trace={1 if state.trace else 0}")
 
     if args.once:
         t0 = time.time()

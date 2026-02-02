@@ -55,3 +55,4 @@ web/node_modules/**
 build-*
 build_*
 *.log
+*.pyc

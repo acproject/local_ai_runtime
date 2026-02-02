@@ -3,6 +3,7 @@
 #include "session_manager.hpp"
 
 #include <chrono>
+#include <cctype>
 #include <sstream>
 #include <string>
 
@@ -46,6 +47,187 @@ static std::optional<std::string> ExtractFirstJsonObject(const std::string& text
     }
   }
   return std::nullopt;
+}
+
+static std::optional<std::vector<ToolCall>> ExtractToolCallsFromJson(const nlohmann::json& original) {
+  if (!original.is_object()) return std::nullopt;
+
+  const nlohmann::json* root = &original;
+  if (root->contains("opencode") && (*root)["opencode"].is_object()) root = &(*root)["opencode"];
+
+  auto make_call = [&](const nlohmann::json& item) -> std::optional<ToolCall> {
+    if (!item.is_object()) return std::nullopt;
+    ToolCall c;
+    c.id = NewId("call");
+    if (item.contains("id") && item["id"].is_string()) c.id = item["id"].get<std::string>();
+
+    if (item.contains("name") && item["name"].is_string()) c.name = item["name"].get<std::string>();
+    if (c.name.empty() && item.contains("tool") && item["tool"].is_string()) c.name = item["tool"].get<std::string>();
+    if (c.name.empty() && item.contains("toolName") && item["toolName"].is_string()) c.name = item["toolName"].get<std::string>();
+    if (c.name.empty() && item.contains("function") && item["function"].is_object() && item["function"].contains("name") &&
+        item["function"]["name"].is_string()) {
+      c.name = item["function"]["name"].get<std::string>();
+    }
+
+    auto set_args = [&](const nlohmann::json& a) {
+      if (a.is_string()) {
+        c.arguments_json = a.get<std::string>();
+      } else if (a.is_object() || a.is_array() || a.is_number() || a.is_boolean()) {
+        c.arguments_json = a.dump();
+      } else if (a.is_null()) {
+        c.arguments_json = "{}";
+      } else {
+        c.arguments_json = a.dump();
+      }
+    };
+
+    if (item.contains("arguments")) {
+      set_args(item["arguments"]);
+    } else if (item.contains("args")) {
+      set_args(item["args"]);
+    } else if (item.contains("input")) {
+      set_args(item["input"]);
+    } else if (item.contains("function") && item["function"].is_object() && item["function"].contains("arguments")) {
+      set_args(item["function"]["arguments"]);
+    }
+
+    if (c.arguments_json.empty()) c.arguments_json = "{}";
+    if (c.name.empty()) return std::nullopt;
+    return c;
+  };
+
+  for (const auto& key : {"tool_call", "toolCall", "toolcall"}) {
+    if (root->contains(key) && (*root)[key].is_object()) {
+      if (auto c = make_call((*root)[key])) return std::vector<ToolCall>{*c};
+    }
+  }
+
+  if (auto c = make_call(*root)) return std::vector<ToolCall>{*c};
+
+  const nlohmann::json* tool_calls = nullptr;
+  for (const auto& key : {"tool_calls", "toolCalls", "toolcalls"}) {
+    if (root->contains(key) && (*root)[key].is_array()) {
+      tool_calls = &(*root)[key];
+      break;
+    }
+  }
+  if (!tool_calls) return std::nullopt;
+
+  std::vector<ToolCall> calls;
+  for (size_t i = 0; i < tool_calls->size(); i++) {
+    if (auto c = make_call((*tool_calls)[i])) calls.push_back(std::move(*c));
+  }
+  if (calls.empty()) return std::nullopt;
+  return calls;
+}
+
+static bool IsToolNameChar(char ch) {
+  const unsigned char c = static_cast<unsigned char>(ch);
+  return std::isalnum(c) || ch == '_' || ch == '-' || ch == '.' || ch == ':' || ch == '/';
+}
+
+static std::optional<std::vector<ToolCall>> ExtractToolCallsFromTaggedText(const std::string& assistant_text) {
+  std::string lower;
+  lower.reserve(assistant_text.size());
+  for (char ch : assistant_text) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+
+  const std::string tool_tag = "<tool_call";
+  const std::string tool_tag2 = "<toolcall";
+  const std::string arg_tag = "<arg_value>";
+  const std::string arg_end = "</arg_value>";
+
+  std::vector<ToolCall> calls;
+  size_t pos = 0;
+  while (pos < lower.size()) {
+    size_t start = lower.find(tool_tag, pos);
+    if (start == std::string::npos) start = lower.find(tool_tag2, pos);
+    if (start == std::string::npos) break;
+
+    size_t tag_close = lower.find('>', start);
+    if (tag_close == std::string::npos) break;
+
+    std::string name;
+    std::string tag_text = assistant_text.substr(start, tag_close - start + 1);
+    std::string tag_lower = lower.substr(start, tag_close - start + 1);
+    auto find_attr = [&](const std::string& attr) -> std::optional<std::string> {
+      auto p = tag_lower.find(attr);
+      if (p == std::string::npos) return std::nullopt;
+      p += attr.size();
+      while (p < tag_text.size() && std::isspace(static_cast<unsigned char>(tag_text[p]))) p++;
+      if (p >= tag_text.size() || tag_text[p] != '=') return std::nullopt;
+      p++;
+      while (p < tag_text.size() && std::isspace(static_cast<unsigned char>(tag_text[p]))) p++;
+      if (p >= tag_text.size()) return std::nullopt;
+      if (tag_text[p] == '"' || tag_text[p] == '\'') {
+        const char q = tag_text[p++];
+        size_t qend = tag_text.find(q, p);
+        if (qend == std::string::npos) return std::nullopt;
+        return tag_text.substr(p, qend - p);
+      }
+      size_t e = p;
+      while (e < tag_text.size() && !std::isspace(static_cast<unsigned char>(tag_text[e])) && tag_text[e] != '>') e++;
+      if (e <= p) return std::nullopt;
+      return tag_text.substr(p, e - p);
+    };
+
+    if (auto n = find_attr("name")) name = Trim(*n);
+    size_t after_name = tag_close + 1;
+    if (name.empty()) {
+      size_t name_start = tag_close + 1;
+      while (name_start < assistant_text.size() && std::isspace(static_cast<unsigned char>(assistant_text[name_start]))) name_start++;
+      size_t name_end = name_start;
+      while (name_end < assistant_text.size() && IsToolNameChar(assistant_text[name_end])) name_end++;
+      name = Trim(assistant_text.substr(name_start, name_end - name_start));
+      after_name = name_end;
+    }
+
+    if (name.empty()) {
+      pos = tag_close + 1;
+      continue;
+    }
+
+    size_t block_start = tag_close + 1;
+    size_t next_tool = lower.find(tool_tag, block_start);
+    size_t next_tool2 = lower.find(tool_tag2, block_start);
+    if (next_tool == std::string::npos || (next_tool2 != std::string::npos && next_tool2 < next_tool)) next_tool = next_tool2;
+    size_t block_end = (next_tool == std::string::npos) ? assistant_text.size() : next_tool;
+
+    std::string args_text;
+    size_t astart = lower.find(arg_tag, after_name);
+    if (astart != std::string::npos && astart < block_end) {
+      astart += arg_tag.size();
+      size_t aend = lower.find(arg_end, astart);
+      if (aend == std::string::npos || aend > block_end) aend = block_end;
+      args_text = Trim(assistant_text.substr(astart, aend - astart));
+    } else {
+      size_t maybe_close = lower.find(arg_end, after_name);
+      if (maybe_close != std::string::npos && maybe_close < block_end) {
+        size_t raw_start = maybe_close + arg_end.size();
+        args_text = Trim(assistant_text.substr(raw_start, block_end - raw_start));
+      } else {
+        args_text = Trim(assistant_text.substr(after_name, block_end - after_name));
+      }
+    }
+
+    if (!args_text.empty()) {
+      if (auto first = ExtractFirstJsonObject(args_text)) args_text = Trim(*first);
+    }
+
+    ToolCall c;
+    c.id = NewId("call");
+    c.name = name;
+    if (args_text.empty()) {
+      c.arguments_json = "{}";
+    } else {
+      c.arguments_json = args_text;
+    }
+    calls.push_back(std::move(c));
+
+    pos = block_end;
+  }
+
+  if (calls.empty()) return std::nullopt;
+  return calls;
 }
 
 static nlohmann::json ErrorResult(const std::string& message) {
@@ -210,41 +392,10 @@ std::optional<nlohmann::json> ParseJsonLoose(const std::string& text) {
 
 std::optional<std::vector<ToolCall>> ParseToolCallsFromAssistantText(const std::string& assistant_text) {
   auto jopt = ParseJsonLoose(assistant_text);
-  if (!jopt) return std::nullopt;
-  const auto& j = *jopt;
-  if (!j.is_object()) return std::nullopt;
-  if (!j.contains("tool_calls") || !j["tool_calls"].is_array()) return std::nullopt;
-
-  std::vector<ToolCall> calls;
-  for (size_t i = 0; i < j["tool_calls"].size(); i++) {
-    const auto& item = j["tool_calls"][i];
-    if (!item.is_object()) continue;
-    ToolCall c;
-    c.id = NewId("call");
-    if (item.contains("id") && item["id"].is_string()) c.id = item["id"].get<std::string>();
-    if (item.contains("name") && item["name"].is_string()) c.name = item["name"].get<std::string>();
-    if (item.contains("function") && item["function"].is_object() && item["function"].contains("name") &&
-        item["function"]["name"].is_string()) {
-      c.name = item["function"]["name"].get<std::string>();
-    }
-    if (item.contains("arguments")) {
-      if (item["arguments"].is_string()) {
-        c.arguments_json = item["arguments"].get<std::string>();
-      } else if (!item["arguments"].is_null()) {
-        c.arguments_json = item["arguments"].dump();
-      }
-    } else if (item.contains("function") && item["function"].is_object() && item["function"].contains("arguments")) {
-      const auto& a = item["function"]["arguments"];
-      if (a.is_string()) {
-        c.arguments_json = a.get<std::string>();
-      } else if (!a.is_null()) {
-        c.arguments_json = a.dump();
-      }
-    }
-    if (!c.name.empty()) calls.push_back(std::move(c));
+  if (jopt) {
+    if (auto from_json = ExtractToolCallsFromJson(*jopt)) return from_json;
   }
-  if (calls.empty()) return std::nullopt;
-  return calls;
+  return ExtractToolCallsFromTaggedText(assistant_text);
 }
 
 }  // namespace runtime

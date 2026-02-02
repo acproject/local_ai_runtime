@@ -13,6 +13,7 @@ static bool StartsWith(const std::string& s, const std::string& prefix) {
 
 static HttpEndpoint ParseHttpEndpoint(const std::string& url, int default_port) {
   HttpEndpoint ep;
+  ep.port = 0;
   std::string s = url;
   if (StartsWith(s, "http://")) {
     ep.scheme = "http";
@@ -112,10 +113,9 @@ RuntimeConfig LoadConfigFromEnv() {
   if (!session_store_type_explicit && !cfg.session_store_path.empty()) cfg.session_store_type = "file";
   bool session_store_endpoint_set = false;
   if (auto ep = GetEnvStr("RUNTIME_SESSION_STORE_ENDPOINT"); !ep.empty()) {
-    cfg.session_store_endpoint = ParseHttpEndpoint(ep, 6385);
+    cfg.session_store_endpoint = ParseHttpEndpoint(ep, 6379);
     session_store_endpoint_set = true;
   }
-  if (cfg.session_store_endpoint.port == 11434) cfg.session_store_endpoint.port = 6385;
   if (!session_store_endpoint_set) {
     if (cfg.session_store_type == "minimemory" || cfg.session_store_type == "redis") {
       cfg.session_store_endpoint = ParseHttpEndpoint("http://127.0.0.1:6379", 6379);

@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <optional>
@@ -114,6 +115,30 @@ static std::string SanitizeBodyForLog(const std::string& body) {
     }
   }
   return j.dump();
+}
+
+static std::string TruncateForLog(std::string s, size_t max_chars) {
+  if (max_chars == 0) return {};
+  if (s.size() <= max_chars) return s;
+  constexpr const char* kSuffix = "...(truncated)";
+  if (max_chars <= std::strlen(kSuffix)) return std::string(kSuffix).substr(0, max_chars);
+  s.resize(max_chars - std::strlen(kSuffix));
+  s += kSuffix;
+  return s;
+}
+
+static bool StartsWith(const std::string& s, const std::string& prefix) {
+  return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+static std::string ToolKindForLog(const std::string& tool_name) {
+  if (StartsWith(tool_name, "lsp.")) return "lsp";
+  if (StartsWith(tool_name, "ide.")) return "ide";
+  if (StartsWith(tool_name, "fs.")) return "fs";
+  if (StartsWith(tool_name, "runtime.")) return "runtime";
+  if (StartsWith(tool_name, "mcp.")) return "mcp";
+  if (tool_name.find(".mcp.") != std::string::npos) return "mcp";
+  return "tool";
 }
 
 static void LogRequestRaw(const httplib::Request& req) {
@@ -270,7 +295,11 @@ static std::string BuildPlannerFinalSystemPrompt() {
 static std::optional<std::string> ExtractFinalFromAssistantJson(const std::string& text) {
   auto j = ParseJsonLoose(text);
   if (!j || !j->is_object()) return std::nullopt;
-  if (j->contains("final") && (*j)["final"].is_string()) return (*j)["final"].get<std::string>();
+  const nlohmann::json* root = &(*j);
+  if (root->contains("opencode") && (*root)["opencode"].is_object()) root = &(*root)["opencode"];
+  if (root->contains("final") && (*root)["final"].is_string()) return (*root)["final"].get<std::string>();
+  if (root->contains("content") && (*root)["content"].is_string()) return (*root)["content"].get<std::string>();
+  if (root->contains("text") && (*root)["text"].is_string()) return (*root)["text"].get<std::string>();
   return std::nullopt;
 }
 
@@ -518,6 +547,7 @@ static std::string ChatOnceText(const std::string& model,
 }
 
 static ToolLoopResult RunPlanner(const std::string& model,
+                                 const std::string& session_id,
                                  const std::vector<ChatMessage>& full_messages,
                                  const std::vector<ToolSchema>& allowed_tools,
                                  const ToolRegistry& registry,
@@ -641,11 +671,17 @@ static ToolLoopResult RunPlanner(const std::string& model,
     r.tool_call_id = c.id;
     r.name = c.name;
 
+    std::cout << "[tool-call] session_id=" << session_id << " id=" << c.id << " name=" << c.name
+              << " kind=" << ToolKindForLog(c.name) << " arguments="
+              << TruncateForLog(SanitizeBodyForLog(c.arguments_json), 2000) << "\n";
+
     if (!allowed_names.empty() && allowed_names.find(c.name) == allowed_names.end()) {
       r.ok = false;
       r.error = "tool not allowed";
       r.result = {{"ok", false}, {"error", r.error}};
       out.results.push_back(r);
+      std::cout << "[tool-result] session_id=" << session_id << " id=" << r.tool_call_id << " name=" << r.name
+                << " ok=0 error=" << r.error << " result=" << TruncateForLog(SanitizeBodyForLog(r.result.dump()), 2000) << "\n";
       exec_msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + r.result.dump()});
       tool_calls_used++;
       continue;
@@ -656,6 +692,8 @@ static ToolLoopResult RunPlanner(const std::string& model,
       r.error = "tool not found";
       r.result = {{"ok", false}, {"error", r.error}};
       out.results.push_back(r);
+      std::cout << "[tool-result] session_id=" << session_id << " id=" << r.tool_call_id << " name=" << r.name
+                << " ok=0 error=" << r.error << " result=" << TruncateForLog(SanitizeBodyForLog(r.result.dump()), 2000) << "\n";
       exec_msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + r.result.dump()});
       tool_calls_used++;
       continue;
@@ -663,6 +701,9 @@ static ToolLoopResult RunPlanner(const std::string& model,
 
     r = (*handler)(c.id, s.arguments);
     out.results.push_back(r);
+    std::cout << "[tool-result] session_id=" << session_id << " id=" << r.tool_call_id << " name=" << r.name
+              << " ok=" << (r.ok ? 1 : 0) << " error=" << (r.error.empty() ? "-" : r.error)
+              << " result=" << TruncateForLog(SanitizeBodyForLog(r.result.dump()), 2000) << "\n";
     exec_msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + r.result.dump()});
     tool_calls_used++;
   }
@@ -683,6 +724,7 @@ static ToolLoopResult RunPlanner(const std::string& model,
 }
 
 static ToolLoopResult RunToolLoop(const std::string& model,
+                                  const std::string& session_id,
                                   const std::vector<ChatMessage>& full_messages,
                                   const std::vector<ToolSchema>& allowed_tools,
                                   const ToolRegistry& registry,
@@ -740,6 +782,11 @@ static ToolLoopResult RunToolLoop(const std::string& model,
           r.result = {{"ok", false}, {"error", r.error}};
           out.executed_calls.push_back(c);
           out.results.push_back(r);
+          std::cout << "[tool-call] session_id=" << session_id << " id=" << c.id << " name=" << c.name
+                    << " kind=" << ToolKindForLog(c.name) << " arguments="
+                    << TruncateForLog(SanitizeBodyForLog(c.arguments_json), 2000) << "\n";
+          std::cout << "[tool-result] session_id=" << session_id << " id=" << r.tool_call_id << " name=" << r.name
+                    << " ok=0 error=" << r.error << " result=" << TruncateForLog(SanitizeBodyForLog(r.result.dump()), 2000) << "\n";
           msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + r.result.dump()});
           continue;
         }
@@ -752,6 +799,11 @@ static ToolLoopResult RunToolLoop(const std::string& model,
           r.result = {{"ok", false}, {"error", r.error}};
           out.executed_calls.push_back(c);
           out.results.push_back(r);
+          std::cout << "[tool-call] session_id=" << session_id << " id=" << c.id << " name=" << c.name
+                    << " kind=" << ToolKindForLog(c.name) << " arguments="
+                    << TruncateForLog(SanitizeBodyForLog(c.arguments_json), 2000) << "\n";
+          std::cout << "[tool-result] session_id=" << session_id << " id=" << r.tool_call_id << " name=" << r.name
+                    << " ok=0 error=" << r.error << " result=" << TruncateForLog(SanitizeBodyForLog(r.result.dump()), 2000) << "\n";
           msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + r.result.dump()});
           continue;
         }
@@ -762,6 +814,41 @@ static ToolLoopResult RunToolLoop(const std::string& model,
         }
         auto jargs = ParseJsonLoose(c.arguments_json);
         if (!jargs) {
+          auto schema = registry.GetSchema(c.name);
+          if (schema) {
+            std::string raw = c.arguments_json;
+            size_t s = 0;
+            while (s < raw.size() && std::isspace(static_cast<unsigned char>(raw[s]))) s++;
+            size_t e = raw.size();
+            while (e > s && std::isspace(static_cast<unsigned char>(raw[e - 1]))) e--;
+            raw = raw.substr(s, e - s);
+
+            const auto& p = schema->parameters;
+            if (p.is_object() && p.contains("type") && p["type"].is_string() && p["type"].get<std::string>() == "string") {
+              jargs = nlohmann::json(raw);
+            } else if (p.is_object() && p.contains("properties") && p["properties"].is_object()) {
+              const auto& props = p["properties"];
+              std::string key;
+              if (p.contains("required") && p["required"].is_array() && p["required"].size() == 1 && p["required"][0].is_string()) {
+                key = p["required"][0].get<std::string>();
+              } else if (props.size() == 1) {
+                key = props.begin().key();
+              } else {
+                for (const auto& cand : {"command", "text", "input"}) {
+                  if (props.contains(cand)) {
+                    key = cand;
+                    break;
+                  }
+                }
+              }
+              if (!key.empty()) {
+                jargs = nlohmann::json::object();
+                (*jargs)[key] = raw;
+              }
+            }
+          }
+        }
+        if (!jargs) {
           ToolResult r;
           r.tool_call_id = c.id;
           r.name = c.name;
@@ -770,15 +857,25 @@ static ToolLoopResult RunToolLoop(const std::string& model,
           r.result = {{"ok", false}, {"error", r.error}};
           out.executed_calls.push_back(c);
           out.results.push_back(r);
+          std::cout << "[tool-call] session_id=" << session_id << " id=" << c.id << " name=" << c.name
+                    << " kind=" << ToolKindForLog(c.name) << " arguments=" << TruncateForLog(c.arguments_json, 2000) << "\n";
+          std::cout << "[tool-result] session_id=" << session_id << " id=" << r.tool_call_id << " name=" << r.name
+                    << " ok=0 error=" << r.error << " result=" << TruncateForLog(SanitizeBodyForLog(r.result.dump()), 2000) << "\n";
           msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + r.result.dump()});
           continue;
         }
         auto handler = registry.GetHandler(c.name);
         if (!handler) continue;
+        std::cout << "[tool-call] session_id=" << session_id << " id=" << c.id << " name=" << c.name
+                  << " kind=" << ToolKindForLog(c.name) << " arguments="
+                  << TruncateForLog(SanitizeBodyForLog(jargs->dump()), 2000) << "\n";
         auto r = (*handler)(c.id, *jargs);
         tool_calls_used++;
         out.executed_calls.push_back(c);
         out.results.push_back(r);
+        std::cout << "[tool-result] session_id=" << session_id << " id=" << r.tool_call_id << " name=" << r.name
+                  << " ok=" << (r.ok ? 1 : 0) << " error=" << (r.error.empty() ? "-" : r.error)
+                  << " result=" << TruncateForLog(SanitizeBodyForLog(r.result.dump()), 2000) << "\n";
         msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + r.result.dump()});
       }
       continue;
@@ -1024,14 +1121,14 @@ void OpenAiRouter::Register(httplib::Server* server) {
       if (!allowed_tools.empty()) {
         if (planner) {
           loop =
-              RunPlanner(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_plan_steps,
+              RunPlanner(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_plan_steps,
                          max_plan_rewrites, max_tool_calls, &err);
           if (loop.planner_failed) {
-            loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
+            loop = RunToolLoop(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
                                max_tool_calls, &err);
           }
         } else {
-          loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
+          loop = RunToolLoop(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
                              max_tool_calls, &err);
         }
       } else {
@@ -1205,14 +1302,14 @@ void OpenAiRouter::Register(httplib::Server* server) {
     if (!allowed_tools.empty()) {
       if (planner) {
         loop =
-            RunPlanner(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_plan_steps,
+            RunPlanner(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_plan_steps,
                        max_plan_rewrites, max_tool_calls, &err);
         if (loop.planner_failed) {
-          loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
+          loop = RunToolLoop(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
                              max_tool_calls, &err);
         }
       } else {
-        loop = RunToolLoop(provider_model, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
+        loop = RunToolLoop(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
                            max_tool_calls, &err);
       }
     } else {
