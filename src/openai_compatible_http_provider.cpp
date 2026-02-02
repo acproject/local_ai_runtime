@@ -15,6 +15,14 @@ static std::unique_ptr<httplib::Client> MakeClient(const HttpEndpoint& ep) {
   cli->set_connection_timeout(5);
   cli->set_read_timeout(300);
   cli->set_write_timeout(30);
+  const auto& auth = CurrentRequestAuthHeaders();
+  if (!auth.empty()) {
+    httplib::Headers headers;
+    for (const auto& kv : auth) {
+      headers.emplace(kv.first, kv.second);
+    }
+    cli->set_default_headers(std::move(headers));
+  }
   return cli;
 }
 

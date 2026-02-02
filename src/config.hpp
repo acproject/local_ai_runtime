@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace runtime {
@@ -41,5 +42,19 @@ struct RuntimeConfig {
 };
 
 RuntimeConfig LoadConfigFromEnv();
+
+using RequestHeaderList = std::vector<std::pair<std::string, std::string>>;
+
+const RequestHeaderList& CurrentRequestAuthHeaders();
+void SetCurrentRequestAuthHeaders(RequestHeaderList headers);
+
+class ScopedRequestAuthHeaders {
+ public:
+  explicit ScopedRequestAuthHeaders(RequestHeaderList headers);
+  ~ScopedRequestAuthHeaders();
+
+ private:
+  RequestHeaderList prev_;
+};
 
 }  // namespace runtime

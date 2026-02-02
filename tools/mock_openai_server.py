@@ -97,6 +97,24 @@ class HfEngine:
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _auth_snapshot(self):
+        out = {}
+        for k in ["authorization", "api-key", "x-api-key", "api_key"]:
+            v = self.headers.get(k)
+            if v is None:
+                continue
+            s = str(v)
+            out[k] = {"present": True, "len": len(s)}
+        return out
+
+    def _log_auth(self):
+        snap = self._auth_snapshot()
+        if not snap:
+            print(f"[mock-openai] {self.command} {self.path} auth=none")
+            return
+        keys = ",".join(sorted(snap.keys()))
+        print(f"[mock-openai] {self.command} {self.path} auth_keys={keys}")
+
     def _send(self, status, obj):
         data = json.dumps(obj).encode("utf-8")
         self.send_response(status)
@@ -106,9 +124,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        self._log_auth()
         if self.path == "/v1/models":
             if ENGINE is not None:
-                self._send(200, {"object": "list", "data": ENGINE.list_models()})
+                self._send(
+                    200,
+                    {
+                        "object": "list",
+                        "data": ENGINE.list_models(),
+                        "received_auth": self._auth_snapshot(),
+                    },
+                )
                 return
             self._send(
                 200,
@@ -117,12 +143,14 @@ class Handler(BaseHTTPRequestHandler):
                     "data": [
                         {"id": "mock-model", "object": "model", "created": 0, "owned_by": "mock-openai"}
                     ],
+                    "received_auth": self._auth_snapshot(),
                 },
             )
             return
         self._send(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
     def do_POST(self):
+        self._log_auth()
         length = int(self.headers.get("Content-Length") or "0")
         body = self.rfile.read(length).decode("utf-8", errors="replace")
         j = None
@@ -169,6 +197,7 @@ class Handler(BaseHTTPRequestHandler):
                                     }
                                 ],
                                 "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
+                                "received_auth": self._auth_snapshot(),
                             },
                         )
                         return
@@ -226,6 +255,7 @@ class Handler(BaseHTTPRequestHandler):
                             }
                         ],
                         "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
+                        "received_auth": self._auth_snapshot(),
                     },
                 )
             except Exception as e:
@@ -249,6 +279,7 @@ class Handler(BaseHTTPRequestHandler):
                     "data": [{"object": "embedding", "embedding": [0.1, 0.2, 0.3], "index": 0}],
                     "model": model,
                     "usage": {"prompt_tokens": None, "total_tokens": None},
+                    "received_auth": self._auth_snapshot(),
                 },
             )
             return

@@ -1,4 +1,5 @@
 #include "openai_router.hpp"
+#include "config.hpp"
 #include "ollama_provider.hpp"
 
 #include <nlohmann/json.hpp>
@@ -149,6 +150,49 @@ static void LogRequestRaw(const httplib::Request& req) {
   if (!req.body.empty()) {
     std::cout << "  body: " << SanitizeBodyForLog(req.body) << "\n";
   }
+}
+
+static std::string TrimAscii(std::string s) {
+  while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) {
+    s.erase(s.begin());
+  }
+  while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) {
+    s.pop_back();
+  }
+  return s;
+}
+
+static std::optional<std::string> ExtractBearerToken(const std::string& authorization_value) {
+  const auto v = TrimAscii(authorization_value);
+  const auto lower = ToLowerAscii(v);
+  constexpr const char* kPrefix = "bearer ";
+  if (lower.size() < std::strlen(kPrefix)) return std::nullopt;
+  if (lower.compare(0, std::strlen(kPrefix), kPrefix) != 0) return std::nullopt;
+  auto token = TrimAscii(v.substr(std::strlen(kPrefix)));
+  if (token.empty()) return std::nullopt;
+  return token;
+}
+
+static RequestHeaderList BuildUpstreamAuthHeaders(const std::string& key) {
+  if (key.empty()) return {};
+  RequestHeaderList out;
+  out.emplace_back("Authorization", std::string("Bearer ") + key);
+  out.emplace_back("x-api-key", key);
+  out.emplace_back("api-key", key);
+  return out;
+}
+
+static RequestHeaderList ExtractUpstreamAuthHeaders(const httplib::Request& req) {
+  if (const auto token = ExtractBearerToken(req.get_header_value("authorization"))) {
+    return BuildUpstreamAuthHeaders(*token);
+  }
+  const auto x_api_key = TrimAscii(req.get_header_value("x-api-key"));
+  if (!x_api_key.empty()) return BuildUpstreamAuthHeaders(x_api_key);
+  const auto api_key = TrimAscii(req.get_header_value("api-key"));
+  if (!api_key.empty()) return BuildUpstreamAuthHeaders(api_key);
+  const auto api_key2 = TrimAscii(req.get_header_value("api_key"));
+  if (!api_key2.empty()) return BuildUpstreamAuthHeaders(api_key2);
+  return {};
 }
 
 static void LogProviderUse(const std::string& provider_name, const std::string& model) {
@@ -907,7 +951,9 @@ ToolRegistry* OpenAiRouter::MutableTools() {
 void OpenAiRouter::Register(httplib::Server* server) {
   const auto prefixes = GetApiPrefixes();
 
-  auto models_handler = [&](const httplib::Request&, httplib::Response& res) {
+  auto models_handler = [&](const httplib::Request& req, httplib::Response& res) {
+    LogRequestRaw(req);
+    ScopedRequestAuthHeaders scope(ExtractUpstreamAuthHeaders(req));
     nlohmann::json out;
     out["object"] = "list";
     out["data"] = nlohmann::json::array();
@@ -950,6 +996,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
 
   auto embeddings_handler = [&](const httplib::Request& req, httplib::Response& res) {
     LogRequestRaw(req);
+    ScopedRequestAuthHeaders scope(ExtractUpstreamAuthHeaders(req));
     auto j = ParseJsonBody(req);
     if (j.is_discarded()) return SendJson(&res, 400, MakeError("invalid json body", "invalid_request_error"));
     if (!j.contains("model") || !j["model"].is_string()) {
@@ -994,6 +1041,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
 
   auto chat_completions_handler = [&](const httplib::Request& req, httplib::Response& res) {
     LogRequestRaw(req);
+    const auto auth_headers = ExtractUpstreamAuthHeaders(req);
     auto j = ParseJsonBody(req);
     if (j.is_discarded()) return SendJson(&res, 400, MakeError("invalid json body", "invalid_request_error"));
     if (!j.contains("model") || !j["model"].is_string()) {
@@ -1115,6 +1163,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
     }
 
     if (!stream) {
+      ScopedRequestAuthHeaders scope(auth_headers);
       std::string err;
       ToolLoopResult loop;
       std::string finish_reason = "stop";
@@ -1211,6 +1260,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
            turn = std::move(turn),
            creq = std::move(creq)](size_t, httplib::DataSink& sink) mutable {
             try {
+              ScopedRequestAuthHeaders scope(auth_headers);
               std::string acc;
               bool wrote_role = false;
               bool write_ok = true;
@@ -1299,21 +1349,26 @@ void OpenAiRouter::Register(httplib::Server* server) {
 
     std::string err;
     ToolLoopResult loop;
-    if (!allowed_tools.empty()) {
-      if (planner) {
-        loop =
-            RunPlanner(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_plan_steps,
-                       max_plan_rewrites, max_tool_calls, &err);
-        if (loop.planner_failed) {
-          loop = RunToolLoop(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
-                             max_tool_calls, &err);
+    {
+      ScopedRequestAuthHeaders scope(auth_headers);
+      if (!allowed_tools.empty()) {
+        if (planner) {
+          loop =
+              RunPlanner(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p,
+                         max_plan_steps, max_plan_rewrites, max_tool_calls, &err);
+          if (loop.planner_failed) {
+            loop =
+                RunToolLoop(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
+                            max_tool_calls, &err);
+          }
+        } else {
+          loop =
+              RunToolLoop(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
+                          max_tool_calls, &err);
         }
       } else {
-        loop = RunToolLoop(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
-                           max_tool_calls, &err);
+        loop.final_text = FakeModelOnce(full_messages);
       }
-    } else {
-      loop.final_text = FakeModelOnce(full_messages);
     }
 
     if (!err.empty() && loop.final_text.empty()) {
@@ -1429,6 +1484,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
 
   auto responses_handler = [&](const httplib::Request& req, httplib::Response& res) {
     LogRequestRaw(req);
+    ScopedRequestAuthHeaders scope(ExtractUpstreamAuthHeaders(req));
     auto j = ParseJsonBody(req);
     if (j.is_discarded()) return SendJson(&res, 400, MakeError("invalid json body", "invalid_request_error"));
     if (!j.contains("model") || !j["model"].is_string()) {
@@ -1488,6 +1544,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
 
   auto anthropic_messages_handler = [&](const httplib::Request& req, httplib::Response& res) {
     LogRequestRaw(req);
+    const auto auth_headers = ExtractUpstreamAuthHeaders(req);
     auto j = ParseJsonBody(req);
     if (j.is_discarded()) return SendJson(&res, 400, MakeAnthropicError("invalid json body", "invalid_request_error"));
     if (!j.contains("model") || !j["model"].is_string()) {
@@ -1531,6 +1588,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
     }
 
     if (!stream) {
+      ScopedRequestAuthHeaders scope(auth_headers);
       std::string err;
       std::string content;
       std::string finish_reason = "stop";
@@ -1651,6 +1709,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
         "text/event-stream",
         [=](size_t, httplib::DataSink& sink) mutable {
           try {
+            ScopedRequestAuthHeaders scope(auth_headers);
             auto write_bytes = [&](const std::string& s) -> bool {
               if (sink.is_writable && !sink.is_writable()) return false;
               if (!sink.write) return false;

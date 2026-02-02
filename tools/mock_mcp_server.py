@@ -153,7 +153,24 @@ def call_for_mode(mode: str, name: str, arguments: dict):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _auth_snapshot(self):
+        out = {}
+        for k in ["authorization", "api-key", "x-api-key", "api_key"]:
+            v = self.headers.get(k)
+            if v is None:
+                continue
+            s = str(v)
+            out[k] = {"present": True, "len": len(s)}
+        return out
+
     def do_POST(self):
+        snap = self._auth_snapshot()
+        if snap:
+            keys = ",".join(sorted(snap.keys()))
+            print(f"[mock-mcp] POST auth_keys={keys}")
+        else:
+            print("[mock-mcp] POST auth=none")
+
         length = int(self.headers.get("content-length", "0"))
         body = self.rfile.read(length).decode("utf-8")
         req = json.loads(body)
@@ -161,19 +178,20 @@ class Handler(BaseHTTPRequestHandler):
         method = req.get("method")
 
         if method == "initialize":
-            result = {"capabilities": {"tools": {}}}
+            result = {"capabilities": {"tools": {}}, "received_auth": snap}
             resp = {"jsonrpc": "2.0", "id": req_id, "result": result}
         elif method == "tools/list":
             resp = {
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "result": {"tools": self.server.tools},
+                "result": {"tools": self.server.tools, "received_auth": snap},
             }
         elif method == "tools/call":
             params = req.get("params") or {}
             name = params.get("name")
             args = params.get("arguments") or {}
             result = call_for_mode(self.server.mode, name, args)
+            result["received_auth"] = snap
             resp = {"jsonrpc": "2.0", "id": req_id, "result": result}
         else:
             resp = {

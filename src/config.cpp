@@ -164,4 +164,25 @@ RuntimeConfig LoadConfigFromEnv() {
   return cfg;
 }
 
+namespace {
+thread_local RequestHeaderList g_request_auth_headers;
+}
+
+const RequestHeaderList& CurrentRequestAuthHeaders() {
+  return g_request_auth_headers;
+}
+
+void SetCurrentRequestAuthHeaders(RequestHeaderList headers) {
+  g_request_auth_headers = std::move(headers);
+}
+
+ScopedRequestAuthHeaders::ScopedRequestAuthHeaders(RequestHeaderList headers) {
+  prev_ = std::move(g_request_auth_headers);
+  g_request_auth_headers = std::move(headers);
+}
+
+ScopedRequestAuthHeaders::~ScopedRequestAuthHeaders() {
+  g_request_auth_headers = std::move(prev_);
+}
+
 }  // namespace runtime
