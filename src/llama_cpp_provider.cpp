@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace runtime {
@@ -892,6 +893,7 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   int last_tok_run = 0;
   std::string emit_buf;
   bool stop_generation = false;
+  const int32_t n_vocab = llama_vocab_n_tokens(vocab);
   auto flush_emit = [&]() {
     if (emit_buf.empty()) return;
     if (!on_delta(emit_buf)) {
@@ -905,6 +907,26 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   for (int i = 0; i < max_new_tokens; i++) {
     const int32_t sample_i = std::max<int32_t>(0, last_batch.n_tokens - 1);
     llama_token next = llama_sampler_sample(sampler.get(), ctx_, sample_i);
+    if (i == 0 && emit_buf.empty() && out_acc.empty() && n_vocab > 0 && llama_vocab_is_eog(vocab, next)) {
+      float* logits = llama_get_logits_ith(ctx_, sample_i);
+      if (logits) {
+        std::vector<std::pair<llama_token, float>> suppressed;
+        suppressed.reserve(8);
+        for (int attempt = 0; attempt < 8 && llama_vocab_is_eog(vocab, next); attempt++) {
+          if (next >= 0 && next < n_vocab) {
+            suppressed.emplace_back(next, logits[next]);
+            logits[next] = -1e9f;
+          } else {
+            break;
+          }
+          next = llama_sampler_sample(sampler.get(), ctx_, sample_i);
+        }
+        for (const auto& it : suppressed) {
+          const llama_token tok = it.first;
+          if (tok >= 0 && tok < n_vocab) logits[tok] = it.second;
+        }
+      }
+    }
     llama_sampler_accept(sampler.get(), next);
     if (llama_vocab_is_eog(vocab, next)) break;
 

@@ -300,6 +300,11 @@ def main():
         )
         store_file = os.path.join(store_dir, "sessions.json")
         renv["RUNTIME_SESSION_STORE"] = store_dir
+        renv["RUNTIME_SESSION_STORE_PATH"] = store_dir
+        renv["RUNTIME_SESSION_STORE_TYPE"] = "file"
+        renv.pop("RUNTIME_SESSION_STORE_ENDPOINT", None)
+        renv.pop("RUNTIME_SESSION_STORE_PASSWORD", None)
+        renv.pop("RUNTIME_SESSION_STORE_DB", None)
         renv["RUNTIME_SESSION_STORE_NAMESPACE"] = "regression"
         if os.name == "nt":
             rt_path = os.path.abspath(args.runtime)
@@ -373,13 +378,17 @@ def main():
                 st, headers, body = http_json(f"http://127.0.0.1:{args.runtime_port}/v1/chat/completions", payload)
                 assert st == 200
                 content = extract_chat_content(body)
-                assert content == "done"
+                if content != "done":
+                    raise AssertionError(f"expected done for trigger={trigger!r}, got={content!r}")
                 trace = headers.get("x-runtime-trace", "")
                 jt = json.loads(trace)
                 assert any(x.get("name") == "ide.search" for x in jt.get("tool_calls") or [])
                 assert any(x.get("name") == "ide.search" for x in jt.get("tool_results") or [])
                 sid = headers.get("x-session-id") or headers.get("X-Session-Id")
                 assert sid
+                deadline = time.time() + 2.0
+                while time.time() < deadline and not os.path.exists(store_file):
+                    time.sleep(0.05)
                 assert os.path.exists(store_file)
                 with open(store_file, "rb") as f:
                     store = json.loads(f.read().decode("utf-8", errors="replace"))
@@ -390,6 +399,21 @@ def main():
                     isinstance(m, dict) and isinstance(m.get("content"), str) and "TOOL_RESULT ide.search" in m.get("content")
                     for m in (sess.get("history") or [])
                 )
+
+            payload = {
+                "model": "mock-model",
+                "trace": True,
+                "messages": [{"role": "user", "content": "mock-toolcall:todowrite_cmd"}],
+                "tools": [{"type": "function", "function": {"name": "todowrite"}}],
+            }
+            st, headers, body = http_json(f"http://127.0.0.1:{args.runtime_port}/v1/chat/completions", payload)
+            assert st == 200
+            content = extract_chat_content(body)
+            assert content == "done"
+            trace = headers.get("x-runtime-trace", "")
+            jt = json.loads(trace)
+            assert any(x.get("name") == "todowrite" for x in jt.get("tool_calls") or [])
+            assert any(x.get("name") == "todowrite" for x in jt.get("tool_results") or [])
 
             payload = {
                 "model": "fake-tool",

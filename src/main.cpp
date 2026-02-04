@@ -137,6 +137,17 @@ static std::optional<std::pair<std::string, std::string>> ParseTodoLine(const st
   return std::nullopt;
 }
 
+static std::optional<int> GetEnvInt(const char* key) {
+  const char* v = std::getenv(key);
+  if (!v || !*v) return std::nullopt;
+  char* end = nullptr;
+  long n = std::strtol(v, &end, 10);
+  if (end == v) return std::nullopt;
+  if (n > INT32_MAX) n = INT32_MAX;
+  if (n < INT32_MIN) n = INT32_MIN;
+  return static_cast<int>(n);
+}
+
 static void MergeTodo(std::unordered_map<std::string, std::string>* best, const std::string& text, const std::string& status) {
   auto it = best->find(text);
   if (it == best->end()) {
@@ -216,7 +227,7 @@ int main() {
   providers.Register(std::make_unique<runtime::OllamaProvider>(cfg.ollama));
   if (cfg.mnn_enabled) providers.Register(std::make_unique<runtime::OpenAiCompatibleHttpProvider>("mnn", cfg.mnn));
   if (cfg.lmdeploy_enabled) providers.Register(std::make_unique<runtime::OpenAiCompatibleHttpProvider>("lmdeploy", cfg.lmdeploy));
-  runtime::OpenAiRouter router(&sessions, &providers, runtime::BuildDefaultToolRegistry());
+  runtime::OpenAiRouter router(&sessions, &providers, runtime::BuildDefaultToolRegistry(cfg));
 
   {
     auto* tools = router.MutableTools();
@@ -422,6 +433,10 @@ int main() {
 
     for (size_t i = 0; i < hosts.size(); i++) {
       auto mcp = std::make_shared<runtime::McpClient>(hosts[i]);
+      if (auto v = GetEnvInt("MCP_CONNECT_TIMEOUT_S")) mcp->SetTimeouts(*v, 0, 0);
+      if (auto v = GetEnvInt("MCP_READ_TIMEOUT_S")) mcp->SetTimeouts(0, *v, 0);
+      if (auto v = GetEnvInt("MCP_WRITE_TIMEOUT_S")) mcp->SetTimeouts(0, 0, *v);
+      if (auto v = GetEnvInt("MCP_MAX_IN_FLIGHT")) mcp->SetMaxInFlight(*v);
       std::string err;
       if (!mcp->Initialize(&err)) continue;
       mcp_servers.push_back(std::move(mcp));

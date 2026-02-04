@@ -114,6 +114,16 @@ std::optional<nlohmann::json> McpClient::CallTool(const std::string& name,
 std::optional<nlohmann::json> McpClient::Rpc(const std::string& method,
                                              const nlohmann::json& params,
                                              std::string* err) {
+  struct InFlightGuard {
+    McpClient* self = nullptr;
+    explicit InFlightGuard(McpClient* s) : self(s) {}
+    ~InFlightGuard() {
+      if (!self) return;
+      std::lock_guard<std::mutex> lock(self->mu_);
+      self->in_flight_--;
+    }
+  };
+
   {
     std::lock_guard<std::mutex> lock(mu_);
     if (in_flight_ >= max_in_flight_) {
@@ -122,11 +132,7 @@ std::optional<nlohmann::json> McpClient::Rpc(const std::string& method,
     }
     in_flight_++;
   }
-
-  auto dec = [&]() {
-    std::lock_guard<std::mutex> lock(mu_);
-    in_flight_--;
-  };
+  InFlightGuard guard(this);
 
   auto cli = MakeClient(endpoint_, connect_timeout_seconds_, read_timeout_seconds_, write_timeout_seconds_);
   nlohmann::json req;
@@ -138,36 +144,30 @@ std::optional<nlohmann::json> McpClient::Rpc(const std::string& method,
   auto path = endpoint_.base_path.empty() ? "/" : endpoint_.base_path;
   auto res = cli->Post(JoinPath("", path), req.dump(), "application/json");
   if (!res) {
-    if (err) *err = "mcp: failed to connect";
-    dec();
+    if (err) *err = std::string("mcp: ") + httplib::to_string(res.error());
     return std::nullopt;
   }
   if (res->status < 200 || res->status >= 300) {
     if (err) *err = "mcp: http " + std::to_string(res->status);
-    dec();
     return std::nullopt;
   }
 
   auto resp = nlohmann::json::parse(res->body, nullptr, false);
   if (resp.is_discarded()) {
     if (err) *err = "mcp: invalid json response";
-    dec();
     return std::nullopt;
   }
 
   auto rpc_err = ExtractJsonRpcError(resp);
   if (!rpc_err.empty()) {
     if (err) *err = rpc_err;
-    dec();
     return std::nullopt;
   }
   auto result = ExtractJsonRpcResult(resp);
   if (!result) {
     if (err) *err = "mcp: missing result";
-    dec();
     return std::nullopt;
   }
-  dec();
   return result;
 }
 

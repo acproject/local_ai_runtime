@@ -133,6 +133,8 @@ def _sse_chat(
     acc = ""
     finish_reason: Optional[str] = None
     done = False
+    tool_calls: Dict[str, Dict[str, str]] = {}
+    tool_call_printed: Dict[str, bool] = {}
     try:
         while True:
             line = resp.readline()
@@ -161,6 +163,56 @@ def _sse_chat(
                 finish_reason = fr
             delta = c0.get("delta")
             if isinstance(delta, dict):
+                tc = delta.get("tool_calls")
+                if isinstance(tc, list) and tc:
+                    for it in tc:
+                        if not isinstance(it, dict):
+                            continue
+                        tc_id = it.get("id")
+                        if not isinstance(tc_id, str) or not tc_id:
+                            continue
+                        fn = it.get("function")
+                        if not isinstance(fn, dict):
+                            fn = {}
+                        name = fn.get("name")
+                        args_piece = fn.get("arguments")
+                        st = tool_calls.get(tc_id) or {"name": "", "arguments": ""}
+                        if isinstance(name, str) and name:
+                            st["name"] = name
+                        if isinstance(args_piece, str) and args_piece:
+                            st["arguments"] = (st.get("arguments") or "") + args_piece
+                        tool_calls[tc_id] = st
+
+                        if not tool_call_printed.get(tc_id):
+                            n = st.get("name") or ""
+                            if n:
+                                sys.stdout.write(f"\n[tool_call] id={tc_id} name={n}\n")
+                                sys.stdout.flush()
+                                tool_call_printed[tc_id] = True
+
+                tr = delta.get("tool_result")
+                if isinstance(tr, dict):
+                    tc_id = tr.get("id")
+                    name = tr.get("name")
+                    ok = tr.get("ok")
+                    error = tr.get("error")
+                    if isinstance(tc_id, str) and tc_id:
+                        st = tool_calls.get(tc_id) or {}
+                        if not isinstance(name, str) or not name:
+                            name = st.get("name") if isinstance(st.get("name"), str) else ""
+                        args = st.get("arguments") if isinstance(st.get("arguments"), str) else ""
+                        if ok is True:
+                            ok_s = "1"
+                        elif ok is False:
+                            ok_s = "0"
+                        else:
+                            ok_s = "?"
+                        err_s = error if isinstance(error, str) and error else "-"
+                        if args:
+                            sys.stdout.write(f"[tool_args] id={tc_id} {args}\n")
+                        sys.stdout.write(f"[tool_result] id={tc_id} name={name} ok={ok_s} error={err_s}\n")
+                        sys.stdout.flush()
+
                 txt = delta.get("content")
                 if isinstance(txt, str) and txt:
                     acc += txt
@@ -589,7 +641,7 @@ def _interactive(state: ChatState) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default="http://127.0.0.1:18081")
+    ap.add_argument("--base-url", default=os.environ.get("RUNTIME_BASE_URL", "http://127.0.0.1:18081"))
     ap.add_argument("--model", default="")
     ap.add_argument("--session-id", default="")
     ap.add_argument("--system", default="")
@@ -612,7 +664,7 @@ def main() -> int:
     model = args.model.strip()
     if not model:
         model = models[0] if models else ""
-    if model not in models and models:
+    if not args.model.strip() and model not in models and models:
         model = models[0]
 
     state = ChatState(

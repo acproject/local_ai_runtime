@@ -11,6 +11,8 @@
 
 namespace runtime {
 
+struct RuntimeConfig;
+
 struct ToolSchema {
   std::string name;
   std::string description;
@@ -55,7 +57,7 @@ class ToolRegistry {
   std::unordered_map<std::string, ToolHandler> handlers_;
 };
 
-ToolRegistry BuildDefaultToolRegistry();
+ToolRegistry BuildDefaultToolRegistry(const RuntimeConfig& cfg);
 
 std::vector<std::string> ExtractToolNames(const std::vector<ToolSchema>& tools);
 

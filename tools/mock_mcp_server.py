@@ -1,5 +1,6 @@
 import argparse
 import json
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
@@ -187,6 +188,9 @@ class Handler(BaseHTTPRequestHandler):
                 "result": {"tools": self.server.tools, "received_auth": snap},
             }
         elif method == "tools/call":
+            delay_ms = int(getattr(self.server, "delay_ms", 0) or 0)
+            if delay_ms > 0:
+                time.sleep(delay_ms / 1000.0)
             params = req.get("params") or {}
             name = params.get("name")
             args = params.get("arguments") or {}
@@ -216,11 +220,13 @@ def main():
     ap.add_argument("--port", type=int, default=9000)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--mode", choices=["echo", "lsp"], default="echo")
+    ap.add_argument("--delay-ms", type=int, default=0)
     args = ap.parse_args()
 
     srv = HTTPServer((args.host, args.port), Handler)
     srv.mode = args.mode
     srv.tools = tools_for_mode(args.mode)
+    srv.delay_ms = int(args.delay_ms or 0)
     srv.serve_forever()
 
 

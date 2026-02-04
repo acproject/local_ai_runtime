@@ -7,9 +7,11 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <future>
 #include <iostream>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 namespace runtime {
@@ -261,12 +263,28 @@ static std::vector<std::string> ParseRequestedToolNames(const nlohmann::json& j)
   std::vector<std::string> out;
   if (!j.contains("tools") || !j["tools"].is_array()) return out;
   for (const auto& t : j["tools"]) {
+    if (t.is_string()) {
+      out.push_back(t.get<std::string>());
+      continue;
+    }
     if (!t.is_object()) continue;
-    if (t.contains("function") && t["function"].is_object() && t["function"].contains("name") &&
-        t["function"]["name"].is_string()) {
-      out.push_back(t["function"]["name"].get<std::string>());
-    } else if (t.contains("name") && t["name"].is_string()) {
+    if (t.contains("function") && t["function"].is_object()) {
+      if (t["function"].contains("name") && t["function"]["name"].is_string()) {
+        out.push_back(t["function"]["name"].get<std::string>());
+        continue;
+      }
+      if (t["function"].contains("tool") && t["function"]["tool"].is_string()) {
+        out.push_back(t["function"]["tool"].get<std::string>());
+        continue;
+      }
+    }
+    if (t.contains("name") && t["name"].is_string()) {
       out.push_back(t["name"].get<std::string>());
+      continue;
+    }
+    if (t.contains("tool") && t["tool"].is_string()) {
+      out.push_back(t["tool"].get<std::string>());
+      continue;
     }
   }
   return out;
@@ -278,6 +296,214 @@ static bool ToolChoiceIsNone(const nlohmann::json& j) {
   if (tc.is_string()) return tc.get<std::string>() == "none";
   if (tc.is_object() && tc.contains("type") && tc["type"].is_string()) return tc["type"].get<std::string>() == "none";
   return false;
+}
+
+static bool WantsServerToolLoop(const nlohmann::json& j) {
+  for (const auto& k : {"max_steps", "max_tool_calls", "planner", "trace"}) {
+    if (j.contains(k)) return true;
+  }
+  if (j.contains("tools") && j["tools"].is_array()) {
+    for (const auto& t : j["tools"]) {
+      if (t.is_string()) return true;
+      if (t.is_object()) {
+        const nlohmann::json* obj = &t;
+        if (t.contains("function") && t["function"].is_object()) obj = &t["function"];
+        if ((obj->contains("name") && (*obj)["name"].is_string() && !(*obj)["name"].get<std::string>().empty()) ||
+            (obj->contains("tool") && (*obj)["tool"].is_string() && !(*obj)["tool"].get<std::string>().empty())) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+static bool ToolsContainFullSchemas(const nlohmann::json& j) {
+  if (!j.contains("tools") || !j["tools"].is_array()) return false;
+  for (const auto& t : j["tools"]) {
+    if (!t.is_object()) continue;
+    const nlohmann::json* obj = &t;
+    if (t.contains("function") && t["function"].is_object()) obj = &t["function"];
+    if (obj->contains("parameters") || obj->contains("description")) return true;
+  }
+  return false;
+}
+
+static std::vector<ToolSchema> ParseRequestedToolSchemas(const nlohmann::json& j) {
+  std::vector<ToolSchema> out;
+  if (!j.contains("tools") || !j["tools"].is_array()) return out;
+  for (const auto& t : j["tools"]) {
+    if (!t.is_object()) continue;
+    ToolSchema s;
+    if (t.contains("function") && t["function"].is_object()) {
+      const auto& fn = t["function"];
+      if (fn.contains("name") && fn["name"].is_string()) s.name = fn["name"].get<std::string>();
+      if (fn.contains("description") && fn["description"].is_string()) s.description = fn["description"].get<std::string>();
+      if (fn.contains("parameters")) s.parameters = fn["parameters"];
+    } else {
+      if (t.contains("name") && t["name"].is_string()) s.name = t["name"].get<std::string>();
+      if (t.contains("description") && t["description"].is_string()) s.description = t["description"].get<std::string>();
+      if (t.contains("parameters")) s.parameters = t["parameters"];
+    }
+    if (s.name.empty()) continue;
+    if (s.parameters.is_null()) s.parameters = nlohmann::json::object();
+    out.push_back(std::move(s));
+  }
+  return out;
+}
+
+static std::optional<std::string> ExtractForcedToolName(const nlohmann::json& j) {
+  if (!j.contains("tool_choice")) return std::nullopt;
+  const auto& tc = j["tool_choice"];
+  if (!tc.is_object()) return std::nullopt;
+  if (tc.contains("type") && tc["type"].is_string() && tc["type"].get<std::string>() == "function") {
+    if (tc.contains("function") && tc["function"].is_object() && tc["function"].contains("name") && tc["function"]["name"].is_string()) {
+      return tc["function"]["name"].get<std::string>();
+    }
+  }
+  return std::nullopt;
+}
+
+static std::string BuildToolSystemPromptClientManaged(const std::vector<ToolSchema>& tools, const std::optional<std::string>& forced_tool) {
+  nlohmann::json tool_list = nlohmann::json::array();
+  for (const auto& t : tools) {
+    tool_list.push_back({{"name", t.name}, {"description", t.description}, {"parameters", t.parameters}});
+  }
+  nlohmann::json spec;
+  spec["tools"] = tool_list;
+
+  std::string prompt;
+  prompt += "You are a tool-using assistant.\n";
+  prompt += "Tool results will be provided as messages with role \"tool\".\n";
+  if (forced_tool && !forced_tool->empty()) {
+    prompt += "When calling a tool, you MUST call: " + *forced_tool + "\n";
+  }
+  prompt += "When you need to call tool(s), respond ONLY with a single JSON object:\n";
+  prompt += "{\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"tool_name\",\"arguments\":{...}}]}\n";
+  prompt += "If you can answer without tools, respond ONLY with:\n";
+  prompt += "{\"final\":\"...\"}\n";
+  prompt += "Never include any extra text outside the JSON.\n";
+  prompt += "Available tools spec:\n";
+  prompt += spec.dump();
+  return prompt;
+}
+
+static nlohmann::json BuildOpenAiToolCalls(const std::vector<ToolCall>& calls) {
+  nlohmann::json out = nlohmann::json::array();
+  for (const auto& c : calls) {
+    out.push_back({{"id", c.id}, {"type", "function"}, {"function", {{"name", c.name}, {"arguments", c.arguments_json}}}});
+  }
+  return out;
+}
+
+static void NormalizeClientManagedToolCalls(const std::vector<ToolSchema>& tools, std::vector<ToolCall>* calls) {
+  if (!calls) return;
+
+  auto find_schema = [&](const std::string& name) -> const ToolSchema* {
+    for (const auto& t : tools) {
+      if (t.name == name) return &t;
+    }
+    return nullptr;
+  };
+
+  auto guess_single_key = [&](const nlohmann::json& params) -> std::optional<std::string> {
+    if (!params.is_object()) return std::nullopt;
+    if (!params.contains("type") || !params["type"].is_string() || params["type"].get<std::string>() != "object") return std::nullopt;
+    if (!params.contains("properties") || !params["properties"].is_object()) return std::nullopt;
+    const auto& props = params["properties"];
+
+    if (params.contains("required") && params["required"].is_array() && params["required"].size() == 1 && params["required"][0].is_string()) {
+      return params["required"][0].get<std::string>();
+    }
+    if (props.size() == 1) return props.begin().key();
+    for (const auto& cand : {"filePath", "path", "uri", "content", "text", "input", "command"}) {
+      if (props.contains(cand)) return std::string(cand);
+    }
+    return std::nullopt;
+  };
+
+  for (auto& c : *calls) {
+    auto j = ParseJsonLoose(c.arguments_json);
+    if (!j) {
+      c.arguments_json = nlohmann::json(c.arguments_json).dump();
+      continue;
+    }
+    if (!j->is_string()) continue;
+
+    const auto raw = j->get<std::string>();
+    const auto* schema = find_schema(c.name);
+    if (!schema) {
+      c.arguments_json = nlohmann::json(raw).dump();
+      continue;
+    }
+    auto key = guess_single_key(schema->parameters);
+    if (!key || key->empty()) {
+      c.arguments_json = nlohmann::json(raw).dump();
+      continue;
+    }
+    nlohmann::json obj = nlohmann::json::object();
+    obj[*key] = raw;
+    c.arguments_json = obj.dump();
+  }
+}
+
+static bool LooksLikePathLike(const std::string& s) {
+  if (s.empty()) return false;
+  if (s.find('/') != std::string::npos || s.find('\\') != std::string::npos) return true;
+  if (s.size() >= 2 && std::isalpha(static_cast<unsigned char>(s[0])) && s[1] == ':') return true;
+  if (s[0] == '.' || s[0] == '~') return true;
+  return false;
+}
+
+static std::optional<std::string> GuessSingleKeyFromParams(const nlohmann::json& params, const std::string& raw) {
+  if (!params.is_object()) return std::nullopt;
+  if (!params.contains("type") || !params["type"].is_string()) return std::nullopt;
+  if (params["type"].get<std::string>() != "object") return std::nullopt;
+  if (!params.contains("properties") || !params["properties"].is_object()) return std::nullopt;
+  const auto& props = params["properties"];
+
+  if (params.contains("required") && params["required"].is_array() && params["required"].size() == 1 && params["required"][0].is_string()) {
+    return params["required"][0].get<std::string>();
+  }
+  if (props.size() == 1) return props.begin().key();
+
+  if (LooksLikePathLike(raw)) {
+    for (const auto& cand : {"filePath", "path", "uri"}) {
+      if (props.contains(cand)) return std::string(cand);
+    }
+  }
+  for (const auto& cand : {"command", "text", "input", "content"}) {
+    if (props.contains(cand)) return std::string(cand);
+  }
+  return std::nullopt;
+}
+
+static void NormalizeToolArgsObject(const ToolSchema& schema, nlohmann::json* args) {
+  if (!args || !args->is_object()) return;
+  if (!schema.parameters.is_object()) return;
+  if (!schema.parameters.contains("properties") || !schema.parameters["properties"].is_object()) return;
+  const auto& props = schema.parameters["properties"];
+
+  auto move_key = [&](const char* dst, std::initializer_list<const char*> srcs) {
+    if (!props.contains(dst)) return;
+    if (args->contains(dst)) return;
+    for (const auto* src : srcs) {
+      if (src && args->contains(src)) {
+        (*args)[dst] = std::move((*args)[src]);
+        args->erase(src);
+        return;
+      }
+    }
+  };
+
+  move_key("filePath", {"path", "filepath", "file_path", "file", "filename", "uri"});
+  move_key("path", {"filePath", "filepath", "file_path", "file", "filename", "uri"});
+  move_key("uri", {"url", "path", "filePath"});
+  move_key("content", {"text", "data", "body", "contents"});
+  move_key("text", {"content", "data", "body"});
+  move_key("oldString", {"old", "from", "pattern", "search", "oldText"});
+  move_key("newString", {"new", "to", "replacement", "replace", "newText"});
+  move_key("replaceAll", {"all", "global"});
 }
 
 static std::string MapFinishReasonToAnthropicStopReason(const std::string& finish_reason) {
@@ -408,6 +634,30 @@ static std::string FakeModelOnce(const std::vector<ChatMessage>& messages) {
     if (last_user.find("lsp.hover") != std::string::npos) {
       return R"({"plan":[{"name":"lsp.hover","arguments":{"uri":"file:///Users/acproject/workspace/cpp_projects/local-ai-runtime/src/main.cpp","line":1,"character":2}}]})";
     }
+    if (last_user.find("read_file") != std::string::npos) {
+      return R"({"plan":[{"name":"read_file","arguments":{"filePath":"src/main.cpp","offset":0,"limit":50}}]})";
+    }
+    if (last_user.find("readFile") != std::string::npos) {
+      return R"({"plan":[{"name":"readFile","arguments":{"filePath":"src/main.cpp","offset":0,"limit":50}}]})";
+    }
+    if (last_user.find("writeFile") != std::string::npos) {
+      return R"({"plan":[{"name":"writeFile","arguments":{"filePath":"build-vs2022-x64-cuda/opencode_tool_test.txt","content":"hello"}}]})";
+    }
+    if (last_user.find("editFile") != std::string::npos) {
+      return R"({"plan":[{"name":"editFile","arguments":{"filePath":"build-vs2022-x64-cuda/opencode_tool_test.txt","oldString":"hello","newString":"hello2","replaceAll":false}}]})";
+    }
+    if (last_user.find("edit") != std::string::npos) {
+      return R"({"plan":[{"name":"edit","arguments":{"filePath":"build-vs2022-x64-cuda/opencode_tool_test.txt","oldString":"hello","newString":"hello2","replaceAll":false}}]})";
+    }
+    if (last_user.find("glob") != std::string::npos) {
+      return R"({"plan":[{"name":"glob","arguments":{"pattern":"*.cpp","path":"src"}}]})";
+    }
+    if (last_user.find("grep") != std::string::npos) {
+      return R"({"plan":[{"name":"grep","arguments":{"pattern":"BuildDefaultToolRegistry","path":"src"}}]})";
+    }
+    if (last_user.find("list") != std::string::npos) {
+      return R"({"plan":[{"name":"list","arguments":{"path":"src"}}]})";
+    }
     return R"({"plan":[{"name":"runtime.add","arguments":{"a":2,"b":3}}]})";
   }
   if (last_system.find("tool result summarizer") != std::string::npos) {
@@ -447,13 +697,47 @@ static std::string FakeModelOnce(const std::vector<ChatMessage>& messages) {
     if (last_user.find("lsp.hover") != std::string::npos) {
       return R"({"tool_calls":[{"id":"call_1","name":"lsp.hover","arguments":{"uri":"file:///Users/acproject/workspace/cpp_projects/local-ai-runtime/src/main.cpp","line":1,"character":2}}]})";
     }
+    if (last_user.find("read_file") != std::string::npos) {
+      return R"({"tool_calls":[{"id":"call_1","name":"read_file","arguments":{"filePath":"src/main.cpp","offset":0,"limit":50}}]})";
+    }
+    if (last_user.find("readFile") != std::string::npos) {
+      return R"({"tool_calls":[{"id":"call_1","name":"readFile","arguments":{"filePath":"src/main.cpp","offset":0,"limit":50}}]})";
+    }
+    if (last_user.find("write_mismatch") != std::string::npos) {
+      return R"({"tool_calls":[{"id":"call_1","name":"write","arguments":{"path":"build-vs2022-x64-cuda/opencode_tool_test_mismatch.txt","content":"hello"}}]})";
+    }
+    if (last_user.find("edit_mismatch") != std::string::npos) {
+      return R"({"tool_calls":[{"id":"call_1","name":"edit","arguments":{"path":"build-vs2022-x64-cuda/opencode_tool_test_mismatch.txt","old":"hello","new":"hello2","replaceAll":false}}]})";
+    }
+    if (last_user.find("writeFile") != std::string::npos) {
+      return R"({"tool_calls":[{"id":"call_1","name":"writeFile","arguments":{"filePath":"build-vs2022-x64-cuda/opencode_tool_test.txt","content":"hello"}}]})";
+    }
+    if (last_user.find("editFile") != std::string::npos) {
+      return R"({"tool_calls":[{"id":"call_1","name":"editFile","arguments":{"filePath":"build-vs2022-x64-cuda/opencode_tool_test.txt","oldString":"hello","newString":"hello2","replaceAll":false}}]})";
+    }
+    if (last_user.find("edit") != std::string::npos) {
+      return R"({"tool_calls":[{"id":"call_1","name":"edit","arguments":{"filePath":"build-vs2022-x64-cuda/opencode_tool_test.txt","oldString":"hello","newString":"hello2","replaceAll":false}}]})";
+    }
+    if (last_user.find("glob") != std::string::npos) {
+      return R"({"tool_calls":[{"id":"call_1","name":"glob","arguments":{"pattern":"*.cpp","path":"src"}}]})";
+    }
+    if (last_user.find("grep") != std::string::npos) {
+      return R"({"tool_calls":[{"id":"call_1","name":"grep","arguments":{"pattern":"BuildDefaultToolRegistry","path":"src"}}]})";
+    }
+    if (last_user.find("list") != std::string::npos) {
+      return R"({"tool_calls":[{"id":"call_1","name":"list","arguments":{"path":"src"}}]})";
+    }
     return R"({"tool_calls":[{"id":"call_1","name":"runtime.add","arguments":{"a":2,"b":3}}]})";
   }
   if (last_user.find("mcp.echo") != std::string::npos || last_user.find("mcp2.mcp.echo") != std::string::npos ||
       last_user.find("runtime.infer_task_status") != std::string::npos || last_user.find("lsp.hover") != std::string::npos ||
       last_user.find("ide.hover") != std::string::npos || last_user.find("ide.read_file") != std::string::npos ||
       last_user.find("ide.search") != std::string::npos || last_user.find("ide.definition") != std::string::npos ||
-      last_user.find("ide.diagnostics") != std::string::npos) {
+      last_user.find("ide.diagnostics") != std::string::npos || last_user.find("read_file") != std::string::npos ||
+      last_user.find("readFile") != std::string::npos || last_user.find("writeFile") != std::string::npos ||
+      last_user.find("editFile") != std::string::npos || last_user.find("edit") != std::string::npos ||
+      last_user.find("glob") != std::string::npos || last_user.find("grep") != std::string::npos ||
+      last_user.find("list") != std::string::npos) {
     auto pos = last_user.find("TOOL_RESULT");
     if (pos != std::string::npos) {
       return std::string("{\"final\":") + nlohmann::json(last_user).dump() + "}";
@@ -856,9 +1140,20 @@ static ToolLoopResult RunToolLoop(const std::string& model,
           out.final_text = "tool call limit exceeded";
           return out;
         }
+        auto schema = registry.GetSchema(c.name);
         auto jargs = ParseJsonLoose(c.arguments_json);
+        if (schema && jargs && jargs->is_string()) {
+          std::string raw = jargs->get<std::string>();
+          const auto& p = schema->parameters;
+          if (p.is_object() && p.contains("type") && p["type"].is_string() && p["type"].get<std::string>() == "string") {
+            jargs = nlohmann::json(raw);
+          } else if (auto key = GuessSingleKeyFromParams(p, raw)) {
+            nlohmann::json obj = nlohmann::json::object();
+            obj[*key] = raw;
+            jargs = std::move(obj);
+          }
+        }
         if (!jargs) {
-          auto schema = registry.GetSchema(c.name);
           if (schema) {
             std::string raw = c.arguments_json;
             size_t s = 0;
@@ -870,28 +1165,13 @@ static ToolLoopResult RunToolLoop(const std::string& model,
             const auto& p = schema->parameters;
             if (p.is_object() && p.contains("type") && p["type"].is_string() && p["type"].get<std::string>() == "string") {
               jargs = nlohmann::json(raw);
-            } else if (p.is_object() && p.contains("properties") && p["properties"].is_object()) {
-              const auto& props = p["properties"];
-              std::string key;
-              if (p.contains("required") && p["required"].is_array() && p["required"].size() == 1 && p["required"][0].is_string()) {
-                key = p["required"][0].get<std::string>();
-              } else if (props.size() == 1) {
-                key = props.begin().key();
-              } else {
-                for (const auto& cand : {"command", "text", "input"}) {
-                  if (props.contains(cand)) {
-                    key = cand;
-                    break;
-                  }
-                }
-              }
-              if (!key.empty()) {
-                jargs = nlohmann::json::object();
-                (*jargs)[key] = raw;
-              }
+            } else if (auto key = GuessSingleKeyFromParams(p, raw)) {
+              jargs = nlohmann::json::object();
+              (*jargs)[*key] = raw;
             }
           }
         }
+        if (schema && jargs && jargs->is_object()) NormalizeToolArgsObject(*schema, &(*jargs));
         if (!jargs) {
           ToolResult r;
           r.tool_call_id = c.id;
@@ -1136,10 +1416,15 @@ void OpenAiRouter::Register(httplib::Server* server) {
     turn.input_messages = req_messages;
 
     std::vector<ToolSchema> allowed_tools;
-    if (!ToolChoiceIsNone(j)) {
+    const bool tool_choice_none = ToolChoiceIsNone(j);
+    const bool client_managed_tools = (!tool_choice_none && ToolsContainFullSchemas(j));
+    const bool server_tool_loop = (!tool_choice_none && WantsServerToolLoop(j) && !client_managed_tools);
+    if (server_tool_loop) {
       auto names = ParseRequestedToolNames(j);
       allowed_tools = tools_.FilterSchemas(names);
     }
+    std::vector<ToolSchema> client_tools = client_managed_tools ? ParseRequestedToolSchemas(j) : std::vector<ToolSchema>();
+    std::optional<std::string> forced_tool = client_managed_tools ? ExtractForcedToolName(j) : std::nullopt;
 
     IProvider* provider = nullptr;
     std::string provider_model = model;
@@ -1157,7 +1442,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
       LogProviderUse(resolved->provider_name, resolved->model);
     }
 
-    if (!allowed_tools.empty() && IsGlmFamilyModel(provider_model)) {
+    if ((!allowed_tools.empty() || !client_tools.empty()) && IsGlmFamilyModel(provider_model)) {
       temperature = 0.7f;
       top_p = 1.0f;
     }
@@ -1167,7 +1452,61 @@ void OpenAiRouter::Register(httplib::Server* server) {
       std::string err;
       ToolLoopResult loop;
       std::string finish_reason = "stop";
-      if (!allowed_tools.empty()) {
+      if (!client_tools.empty()) {
+        std::vector<ChatMessage> msgs;
+        msgs.reserve(full_messages.size() + 2);
+        msgs.push_back({"system", BuildToolSystemPromptClientManaged(client_tools, forced_tool)});
+        for (const auto& m : full_messages) msgs.push_back(m);
+
+        std::string assistant_text;
+        if (model == "fake-tool") {
+          assistant_text = FakeModelOnce(msgs);
+        } else {
+          ChatRequest creq;
+          creq.model = provider_model;
+          creq.stream = false;
+          creq.max_tokens = max_tokens;
+          creq.temperature = temperature;
+          creq.top_p = top_p;
+          creq.min_p = min_p;
+          creq.messages = msgs;
+          auto resp = provider->ChatOnce(creq, &err);
+          if (!resp) return SendJson(&res, 502, MakeError(err.empty() ? "upstream error" : err, "api_error"));
+          assistant_text = resp->content;
+          finish_reason = resp->finish_reason;
+        }
+
+        if (auto calls = ParseToolCallsFromAssistantText(assistant_text)) {
+          NormalizeClientManagedToolCalls(client_tools, &(*calls));
+          turn.output_text = assistant_text;
+          sessions_->AppendTurn(session_id, turn);
+          if (use_server_history) {
+            sessions_->AppendToHistory(session_id, req_messages);
+            sessions_->AppendToHistory(session_id, {ChatMessage{"assistant", assistant_text}});
+          }
+
+          nlohmann::json out;
+          out["id"] = NewId("chatcmpl");
+          out["object"] = "chat.completion";
+          out["created"] = NowSeconds();
+          out["model"] = model;
+          out["choices"] = nlohmann::json::array();
+          nlohmann::json choice;
+          choice["index"] = 0;
+          choice["message"] = {{"role", "assistant"}, {"content", nullptr}, {"tool_calls", BuildOpenAiToolCalls(*calls)}};
+          choice["finish_reason"] = "tool_calls";
+          out["choices"].push_back(std::move(choice));
+          out["usage"] = {{"prompt_tokens", nullptr}, {"completion_tokens", nullptr}, {"total_tokens", nullptr}};
+          return SendJson(&res, 200, out);
+        }
+
+        if (auto final = ExtractFinalFromAssistantJson(assistant_text)) {
+          loop.final_text = *final;
+          finish_reason = "stop";
+        } else {
+          loop.final_text = assistant_text;
+        }
+      } else if (!allowed_tools.empty()) {
         if (planner) {
           loop =
               RunPlanner(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_plan_steps,
@@ -1243,6 +1582,149 @@ void OpenAiRouter::Register(httplib::Server* server) {
     auto id = NewId("chatcmpl");
     auto created = NowSeconds();
 
+    if (!client_tools.empty()) {
+      ScopedRequestAuthHeaders scope(auth_headers);
+      std::string err;
+
+      std::vector<ChatMessage> msgs;
+      msgs.reserve(full_messages.size() + 2);
+      msgs.push_back({"system", BuildToolSystemPromptClientManaged(client_tools, forced_tool)});
+      for (const auto& m : full_messages) msgs.push_back(m);
+
+      std::string assistant_text;
+      if (model == "fake-tool") {
+        assistant_text = FakeModelOnce(msgs);
+      } else {
+        ChatRequest creq;
+        creq.model = provider_model;
+        creq.stream = false;
+        creq.max_tokens = max_tokens;
+        creq.temperature = temperature;
+        creq.top_p = top_p;
+        creq.min_p = min_p;
+        creq.messages = msgs;
+        auto resp = provider->ChatOnce(creq, &err);
+        if (!resp) return SendJson(&res, 502, MakeError(err.empty() ? "upstream error" : err, "api_error"));
+        assistant_text = resp->content;
+      }
+
+      auto calls = ParseToolCallsFromAssistantText(assistant_text);
+      if (calls) NormalizeClientManagedToolCalls(client_tools, &(*calls));
+      std::string final_text;
+      if (!calls) {
+        if (auto final = ExtractFinalFromAssistantJson(assistant_text)) {
+          final_text = *final;
+        } else {
+          final_text = assistant_text;
+        }
+      }
+
+      res.set_chunked_content_provider(
+          "text/event-stream",
+          [=,
+           this,
+           turn = std::move(turn),
+           assistant_text = std::move(assistant_text),
+           calls = std::move(calls),
+           final_text = std::move(final_text)](size_t, httplib::DataSink& sink) mutable {
+            try {
+              auto write_bytes = [&](const std::string& s) -> bool {
+                if (sink.is_writable && !sink.is_writable()) return false;
+                if (!sink.write) return false;
+                return sink.write(s.data(), s.size());
+              };
+
+              if (!write_bytes(std::string(": init\n") + std::string(2048, ' ') + "\n\n")) {
+                sink.done();
+                return false;
+              }
+
+              auto write_chunk = [&](const nlohmann::json& delta, const nlohmann::json& finish_reason) -> bool {
+                nlohmann::json chunk;
+                chunk["id"] = id;
+                chunk["object"] = "chat.completion.chunk";
+                chunk["created"] = created;
+                chunk["model"] = model;
+                nlohmann::json choice;
+                choice["index"] = 0;
+                choice["delta"] = delta;
+                choice["finish_reason"] = finish_reason;
+                chunk["choices"] = nlohmann::json::array({choice});
+                return write_bytes(SseData(chunk));
+              };
+
+              nlohmann::json role_delta;
+              role_delta["role"] = "assistant";
+              if (!write_chunk(role_delta, nullptr)) {
+                sink.done();
+                return false;
+              }
+
+              if (calls) {
+                constexpr size_t kArgChunk = 48;
+                for (size_t i = 0; i < calls->size(); i++) {
+                  const auto& c = (*calls)[i];
+                  std::string args = c.arguments_json.empty() ? "{}" : c.arguments_json;
+                  for (size_t off = 0; off < args.size(); off += kArgChunk) {
+                    const bool first_piece = (off == 0);
+                    nlohmann::json tool_delta;
+                    nlohmann::json tc;
+                    tc["index"] = static_cast<int>(i);
+                    tc["id"] = c.id;
+                    tc["type"] = "function";
+                    nlohmann::json func;
+                    if (first_piece) func["name"] = c.name;
+                    func["arguments"] = args.substr(off, kArgChunk);
+                    tc["function"] = std::move(func);
+                    tool_delta["tool_calls"] = nlohmann::json::array({tc});
+                    if (!write_chunk(tool_delta, nullptr)) {
+                      sink.done();
+                      return false;
+                    }
+                  }
+                }
+                if (!write_chunk(nlohmann::json::object(), "tool_calls")) {
+                  sink.done();
+                  return false;
+                }
+              } else {
+                if (!final_text.empty()) {
+                  nlohmann::json d;
+                  d["content"] = final_text;
+                  if (!write_chunk(d, nullptr)) {
+                    sink.done();
+                    return false;
+                  }
+                }
+                if (!write_chunk(nlohmann::json::object(), "stop")) {
+                  sink.done();
+                  return false;
+                }
+              }
+
+              if (calls) {
+                turn.output_text = assistant_text;
+              } else {
+                turn.output_text = final_text;
+              }
+              sessions_->AppendTurn(session_id, turn);
+              if (use_server_history) {
+                sessions_->AppendToHistory(session_id, turn.input_messages);
+                sessions_->AppendToHistory(session_id, {ChatMessage{"assistant", calls ? assistant_text : final_text}});
+              }
+
+              write_bytes(SseDone());
+              sink.done();
+              return false;
+            } catch (...) {
+              sink.done();
+              return false;
+            }
+          },
+          [](bool) {});
+      return;
+    }
+
     if (allowed_tools.empty() && model != "fake-tool") {
       ChatRequest creq;
       creq.model = provider_model;
@@ -1271,6 +1753,12 @@ void OpenAiRouter::Register(httplib::Server* server) {
                 if (!sink.write) return false;
                 return sink.write(s.data(), s.size());
               };
+
+              write_ok = write_bytes(std::string(": init\n") + std::string(2048, ' ') + "\n\n");
+              if (!write_ok) {
+                sink.done();
+                return false;
+              }
 
               auto write_chunk = [&](const nlohmann::json& delta, const nlohmann::json& finish_reason) -> bool {
                 nlohmann::json chunk;
@@ -1347,41 +1835,42 @@ void OpenAiRouter::Register(httplib::Server* server) {
       return;
     }
 
-    std::string err;
-    ToolLoopResult loop;
-    {
+    std::optional<ToolLoopResult> precomputed_loop;
+    std::string precomputed_err;
+    if (trace) {
       ScopedRequestAuthHeaders scope(auth_headers);
       if (!allowed_tools.empty()) {
         if (planner) {
-          loop =
-              RunPlanner(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p,
-                         max_plan_steps, max_plan_rewrites, max_tool_calls, &err);
-          if (loop.planner_failed) {
-            loop =
-                RunToolLoop(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
-                            max_tool_calls, &err);
+          precomputed_loop =
+              RunPlanner(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_plan_steps,
+                         max_plan_rewrites, max_tool_calls, &precomputed_err);
+          if (precomputed_loop->planner_failed) {
+            precomputed_loop = RunToolLoop(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p,
+                                           max_steps, max_tool_calls, &precomputed_err);
           }
         } else {
-          loop =
-              RunToolLoop(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p, max_steps,
-                          max_tool_calls, &err);
+          precomputed_loop = RunToolLoop(provider_model, session_id, full_messages, allowed_tools, tools_, provider, max_tokens, temperature, top_p, min_p,
+                                         max_steps, max_tool_calls, &precomputed_err);
         }
       } else {
-        loop.final_text = FakeModelOnce(full_messages);
+        ToolLoopResult tmp;
+        tmp.final_text = FakeModelOnce(full_messages);
+        precomputed_loop = std::move(tmp);
       }
-    }
 
-    if (!err.empty() && loop.final_text.empty()) {
-      return SendJson(&res, 502, MakeError(err, "api_error"));
+      if (!precomputed_err.empty() && precomputed_loop->final_text.empty()) {
+        return SendJson(&res, 502, MakeError(precomputed_err, "api_error"));
+      }
+      res.set_header("x-runtime-trace", BuildRuntimeTrace(*precomputed_loop).dump());
     }
-    if (trace) res.set_header("x-runtime-trace", BuildRuntimeTrace(loop).dump());
 
     res.set_chunked_content_provider(
         "text/event-stream",
         [=,
          this,
          turn = std::move(turn),
-         loop = std::move(loop)](size_t, httplib::DataSink& sink) mutable {
+         precomputed_loop = std::move(precomputed_loop),
+         precomputed_err = std::move(precomputed_err)](size_t, httplib::DataSink& sink) mutable {
           try {
             std::string acc;
             bool wrote_role = false;
@@ -1391,6 +1880,11 @@ void OpenAiRouter::Register(httplib::Server* server) {
               if (!sink.write) return false;
               return sink.write(s.data(), s.size());
             };
+
+            if (!write_bytes(std::string(": init\n") + std::string(2048, ' ') + "\n\n")) {
+              sink.done();
+              return false;
+            }
 
             auto write_chunk = [&](const nlohmann::json& delta, const nlohmann::json& finish_reason) -> bool {
               nlohmann::json chunk;
@@ -1406,41 +1900,476 @@ void OpenAiRouter::Register(httplib::Server* server) {
               return write_bytes(SseData(chunk));
             };
 
-            constexpr size_t kArgChunk = 48;
-            for (size_t i = 0; i < loop.executed_calls.size(); i++) {
-              const auto& c = loop.executed_calls[i];
-              std::string args = c.arguments_json.empty() ? "{}" : c.arguments_json;
-              for (size_t off = 0; off < args.size(); off += kArgChunk) {
-                const bool first_piece = (off == 0);
-                nlohmann::json tool_delta;
-                if (!wrote_role) {
-                  tool_delta["role"] = "assistant";
-                  wrote_role = true;
-                }
-                nlohmann::json tc;
-                tc["index"] = static_cast<int>(i);
-                tc["id"] = c.id;
-                tc["type"] = "function";
-                nlohmann::json func;
-                if (first_piece) func["name"] = c.name;
-                func["arguments"] = args.substr(off, kArgChunk);
-                tc["function"] = std::move(func);
-                tool_delta["tool_calls"] = nlohmann::json::array({tc});
-                if (!write_chunk(tool_delta, nullptr)) {
-                  sink.done();
-                  return false;
-                }
+            if (!wrote_role) {
+              nlohmann::json delta;
+              delta["role"] = "assistant";
+              wrote_role = true;
+              if (!write_chunk(delta, nullptr)) {
+                sink.done();
+                return false;
               }
+            }
+
+            ToolLoopResult loop;
+            std::string err;
+            if (precomputed_loop) {
+              loop = std::move(*precomputed_loop);
+              err = std::move(precomputed_err);
+            } else {
+              auto last_keepalive = std::chrono::steady_clock::now();
+              auto last_progress = std::chrono::steady_clock::now();
+              int model_timeout_s = 900;
+              int tool_timeout_s = 300;
+              int progress_ms = 2000;
+              if (const char* v = std::getenv("RUNTIME_STREAM_MODEL_TIMEOUT_S"); v && *v) model_timeout_s = std::atoi(v);
+              if (const char* v = std::getenv("RUNTIME_STREAM_TOOL_TIMEOUT_S"); v && *v) tool_timeout_s = std::atoi(v);
+              if (const char* v = std::getenv("RUNTIME_STREAM_PROGRESS_MS"); v && *v) progress_ms = std::atoi(v);
+
+              auto maybe_progress = [&]() -> bool {
+                if (progress_ms <= 0) return true;
+                auto now = std::chrono::steady_clock::now();
+                if (now - last_progress < std::chrono::milliseconds(progress_ms)) return true;
+                last_progress = now;
+                return write_bytes(std::string(": progress ") + std::string(256, ' ') + "\n\n");
+              };
+
+              auto maybe_keepalive = [&]() -> bool {
+                auto now = std::chrono::steady_clock::now();
+                if (now - last_keepalive < std::chrono::seconds(1)) return true;
+                last_keepalive = now;
+                return write_bytes(": keepalive\n\n");
+              };
+
+              enum class WaitState { Ready, Disconnected, Timeout };
+              auto wait_ready = [&](auto& fut, int timeout_s) -> WaitState {
+                const auto start = std::chrono::steady_clock::now();
+                while (fut.wait_for(std::chrono::milliseconds(250)) != std::future_status::ready) {
+                  if (!maybe_keepalive()) return WaitState::Disconnected;
+                  if (!maybe_progress()) return WaitState::Disconnected;
+                  if (timeout_s > 0) {
+                    auto now = std::chrono::steady_clock::now();
+                    if (now - start >= std::chrono::seconds(timeout_s)) return WaitState::Timeout;
+                  }
+                }
+                return WaitState::Ready;
+              };
+
+              auto write_tool_call = [&](int index, const ToolCall& c) -> bool {
+                constexpr size_t kArgChunk = 48;
+                std::string args = c.arguments_json.empty() ? "{}" : c.arguments_json;
+                for (size_t off = 0; off < args.size(); off += kArgChunk) {
+                  const bool first_piece = (off == 0);
+                  nlohmann::json tool_delta;
+                  nlohmann::json tc;
+                  tc["index"] = index;
+                  tc["id"] = c.id;
+                  tc["type"] = "function";
+                  nlohmann::json func;
+                  if (first_piece) func["name"] = c.name;
+                  func["arguments"] = args.substr(off, kArgChunk);
+                  tc["function"] = std::move(func);
+                  tool_delta["tool_calls"] = nlohmann::json::array({tc});
+                  if (!write_chunk(tool_delta, nullptr)) return false;
+                }
+                return true;
+              };
+
+              auto write_tool_result = [&](const ToolResult& r) -> bool {
+                nlohmann::json delta;
+                delta["tool_result"] = {{"id", r.tool_call_id}, {"name", r.name}, {"ok", r.ok}, {"error", r.error}};
+                return write_chunk(delta, nullptr);
+              };
+
+              auto run_chat_once = [&](const std::vector<ChatMessage>& messages, std::string* out_text) -> bool {
+                if (provider_model == "fake-tool") {
+                  *out_text = FakeModelOnce(messages);
+                  return true;
+                }
+                std::promise<std::pair<std::string, std::string>> p;
+                auto fut = p.get_future();
+                std::thread([=, p = std::move(p)]() mutable {
+                  ScopedRequestAuthHeaders scope(auth_headers);
+                  std::string local_err;
+                  ChatRequest req;
+                  req.model = provider_model;
+                  req.stream = false;
+                  req.max_tokens = max_tokens;
+                  req.temperature = temperature;
+                  req.top_p = top_p;
+                  req.min_p = min_p;
+                  req.messages = messages;
+                  auto resp = provider->ChatOnce(req, &local_err);
+                  if (!resp) {
+                    p.set_value(std::make_pair(std::string(), local_err.empty() ? std::string("upstream error") : local_err));
+                    return;
+                  }
+                  p.set_value(std::make_pair(resp->content, std::string()));
+                }).detach();
+
+                auto st = wait_ready(fut, model_timeout_s);
+                if (st == WaitState::Disconnected) return false;
+                if (st == WaitState::Timeout) {
+                  if (out_text) *out_text = "";
+                  err = "timeout waiting for model";
+                  return true;
+                }
+
+                auto got = fut.get();
+                if (!got.second.empty()) {
+                  if (out_text) *out_text = "";
+                  err = std::move(got.second);
+                  return true;
+                }
+                if (out_text) *out_text = std::move(got.first);
+                return true;
+              };
+
+              auto execute_tool = [&](const ToolCall& c, const nlohmann::json& jargs, ToolResult* out_r) -> bool {
+                auto handler = tools_.GetHandler(c.name);
+                if (!handler) {
+                  ToolResult r;
+                  r.tool_call_id = c.id;
+                  r.name = c.name;
+                  r.ok = false;
+                  r.error = "tool not found";
+                  r.result = {{"ok", false}, {"error", r.error}};
+                  *out_r = std::move(r);
+                  return true;
+                }
+                std::promise<ToolResult> p;
+                auto fut = p.get_future();
+                std::thread([&, p = std::move(p)]() mutable {
+                  ScopedRequestAuthHeaders scope(auth_headers);
+                  p.set_value((*handler)(c.id, jargs));
+                }).detach();
+
+                auto st = wait_ready(fut, tool_timeout_s);
+                if (st == WaitState::Disconnected) return false;
+                if (st == WaitState::Timeout) {
+                  ToolResult r;
+                  r.tool_call_id = c.id;
+                  r.name = c.name;
+                  r.ok = false;
+                  r.error = "timeout waiting for tool";
+                  r.result = {{"ok", false}, {"error", r.error}};
+                  *out_r = std::move(r);
+                  return true;
+                }
+
+                *out_r = fut.get();
+                return true;
+              };
+
+              std::unordered_set<std::string> allowed_names;
+              for (const auto& t : allowed_tools) allowed_names.insert(t.name);
+
+              std::vector<ChatMessage> msgs;
+              msgs.reserve(full_messages.size() + 8);
+              if (!allowed_tools.empty()) msgs.push_back({"system", BuildToolSystemPrompt(allowed_tools)});
+              for (const auto& m : full_messages) msgs.push_back(m);
+
+              if (max_steps <= 0) max_steps = 1;
+              if (max_tool_calls < 0) max_tool_calls = 0;
+
+              int tool_calls_used = 0;
+
+              auto run_tool_loop_stream = [&]() -> bool {
+                for (int step = 0; step < max_steps; step++) {
+                  loop.steps = step + 1;
+                  std::string assistant_text;
+                  if (!run_chat_once(msgs, &assistant_text)) return false;
+                  if (!err.empty() && assistant_text.empty()) return true;
+
+                  if (auto calls = ParseToolCallsFromAssistantText(assistant_text)) {
+                    for (auto& c : *calls) {
+                      int idx = static_cast<int>(loop.executed_calls.size());
+                      loop.executed_calls.push_back(c);
+                      if (!write_tool_call(idx, c)) return false;
+
+                      if (!allowed_names.empty() && allowed_names.find(c.name) == allowed_names.end()) {
+                        ToolResult r;
+                        r.tool_call_id = c.id;
+                        r.name = c.name;
+                        r.ok = false;
+                        r.error = "tool not allowed";
+                        r.result = {{"ok", false}, {"error", r.error}};
+                        loop.results.push_back(r);
+                        msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + r.result.dump()});
+                        if (!write_tool_result(r)) return false;
+                        continue;
+                      }
+                      if (!tools_.HasTool(c.name)) {
+                        ToolResult r;
+                        r.tool_call_id = c.id;
+                        r.name = c.name;
+                        r.ok = false;
+                        r.error = "tool not found";
+                        r.result = {{"ok", false}, {"error", r.error}};
+                        loop.results.push_back(r);
+                        msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + r.result.dump()});
+                        if (!write_tool_result(r)) return false;
+                        continue;
+                      }
+                      if (tool_calls_used >= max_tool_calls) {
+                        loop.hit_tool_limit = true;
+                        loop.final_text = "tool call limit exceeded";
+                        return true;
+                      }
+
+                      auto schema = tools_.GetSchema(c.name);
+                      auto jargs = ParseJsonLoose(c.arguments_json);
+                      if (schema && jargs && jargs->is_string()) {
+                        std::string raw = jargs->get<std::string>();
+                        const auto& p = schema->parameters;
+                        if (p.is_object() && p.contains("type") && p["type"].is_string() && p["type"].get<std::string>() == "string") {
+                          jargs = nlohmann::json(raw);
+                        } else if (auto key = GuessSingleKeyFromParams(p, raw)) {
+                          nlohmann::json obj = nlohmann::json::object();
+                          obj[*key] = raw;
+                          jargs = std::move(obj);
+                        }
+                      }
+                      if (!jargs) {
+                        if (schema) {
+                          std::string raw = c.arguments_json;
+                          size_t s = 0;
+                          while (s < raw.size() && std::isspace(static_cast<unsigned char>(raw[s]))) s++;
+                          size_t e = raw.size();
+                          while (e > s && std::isspace(static_cast<unsigned char>(raw[e - 1]))) e--;
+                          raw = raw.substr(s, e - s);
+
+                          const auto& p = schema->parameters;
+                          if (p.is_object() && p.contains("type") && p["type"].is_string() && p["type"].get<std::string>() == "string") {
+                            jargs = nlohmann::json(raw);
+                          } else if (auto key = GuessSingleKeyFromParams(p, raw)) {
+                            jargs = nlohmann::json::object();
+                            (*jargs)[*key] = raw;
+                          }
+                        }
+                      }
+
+                      if (schema && jargs && jargs->is_object()) NormalizeToolArgsObject(*schema, &(*jargs));
+                      if (!jargs) {
+                        ToolResult r;
+                        r.tool_call_id = c.id;
+                        r.name = c.name;
+                        r.ok = false;
+                        r.error = "invalid tool arguments json";
+                        r.result = {{"ok", false}, {"error", r.error}};
+                        loop.results.push_back(r);
+                        msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + r.result.dump()});
+                        if (!write_tool_result(r)) return false;
+                        continue;
+                      }
+
+                      ToolResult r;
+                      if (!execute_tool(c, *jargs, &r)) return false;
+                      tool_calls_used++;
+                      loop.results.push_back(r);
+                      msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + r.result.dump()});
+                      if (!write_tool_result(r)) return false;
+                    }
+                    continue;
+                  }
+
+                  if (auto final = ExtractFinalFromAssistantJson(assistant_text)) {
+                    loop.final_text = *final;
+                    return true;
+                  }
+
+                  loop.final_text = assistant_text;
+                  return true;
+                }
+                loop.hit_step_limit = true;
+                loop.final_text = "tool loop exceeded max steps";
+                return true;
+              };
+
+              auto run_planner_stream = [&]() -> bool {
+                loop.used_planner = true;
+                if (max_plan_steps <= 0) max_plan_steps = 1;
+                if (max_plan_rewrites < 0) max_plan_rewrites = 0;
+                if (max_tool_calls < 0) max_tool_calls = 0;
+
+                std::vector<ChatMessage> plan_msgs;
+                plan_msgs.reserve(full_messages.size() + 2);
+                plan_msgs.push_back({"system", BuildPlannerSystemPrompt(allowed_tools, max_plan_steps)});
+                for (const auto& m : full_messages) plan_msgs.push_back(m);
+
+                std::optional<std::vector<PlannerPlanStep>> plan;
+                std::string plan_text;
+                int rewrites = 0;
+                for (int attempt = 0; attempt <= max_plan_rewrites; attempt++) {
+                  if (!run_chat_once(plan_msgs, &plan_text)) return false;
+                  if (!err.empty() && plan_text.empty()) {
+                    loop.planner_failed = true;
+                    return true;
+                  }
+                  if (auto final = ExtractFinalFromAssistantJson(plan_text)) {
+                    loop.final_text = *final;
+                    loop.steps = 1;
+                    loop.plan_steps = 0;
+                    return true;
+                  }
+                  plan = ParsePlannerPlan(plan_text);
+                  if (!plan) {
+                    if (attempt == max_plan_rewrites) {
+                      loop.planner_failed = true;
+                      loop.final_text = plan_text;
+                      loop.steps = 1;
+                      return true;
+                    }
+                    plan_msgs.push_back({"user", "Plan invalid JSON. Return a corrected plan JSON only."});
+                    continue;
+                  }
+                  bool ok = true;
+                  std::string why;
+                  for (const auto& s : *plan) {
+                    if (!allowed_names.empty() && allowed_names.find(s.name) == allowed_names.end()) {
+                      ok = false;
+                      why = "tool not allowed: " + s.name;
+                      break;
+                    }
+                    auto schema = tools_.GetSchema(s.name);
+                    if (!schema) {
+                      ok = false;
+                      why = "tool not found: " + s.name;
+                      break;
+                    }
+                    std::string schema_err;
+                    if (!ValidateSchemaLoose(schema->parameters, s.arguments, &schema_err)) {
+                      ok = false;
+                      why = "invalid arguments for " + s.name + ": " + schema_err;
+                      break;
+                    }
+                  }
+                  if (ok) break;
+                  if (attempt == max_plan_rewrites) {
+                    loop.planner_failed = true;
+                    loop.final_text = why;
+                    loop.steps = 1;
+                    return true;
+                  }
+                  plan_msgs.push_back({"user", "Plan rejected: " + why + ". Return a corrected plan JSON only."});
+                  plan.reset();
+                  rewrites = attempt + 1;
+                }
+
+                if (!plan) {
+                  loop.planner_failed = true;
+                  loop.final_text = plan_text;
+                  loop.steps = 1;
+                  return true;
+                }
+
+                if (static_cast<int>(plan->size()) > max_plan_steps) plan->resize(static_cast<size_t>(max_plan_steps));
+                loop.plan_steps = static_cast<int>(plan->size());
+                loop.plan_rewrites = rewrites;
+                loop.plan = nlohmann::json::array();
+                for (const auto& s : *plan) loop.plan.push_back({{"name", s.name}, {"arguments", s.arguments}});
+
+                std::vector<ChatMessage> exec_msgs;
+                exec_msgs.reserve(full_messages.size() + loop.plan_steps + 4);
+                for (const auto& m : full_messages) exec_msgs.push_back(m);
+
+                int tool_calls_used_local = 0;
+                for (size_t i = 0; i < plan->size(); i++) {
+                  if (tool_calls_used_local >= max_tool_calls) {
+                    loop.hit_tool_limit = true;
+                    loop.final_text = "tool call limit exceeded";
+                    loop.steps = static_cast<int>(i + 1);
+                    return true;
+                  }
+
+                  const auto& s = (*plan)[i];
+                  ToolCall c;
+                  c.id = "plan_" + std::to_string(i + 1);
+                  c.name = s.name;
+                  c.arguments_json = s.arguments.dump();
+                  int idx = static_cast<int>(loop.executed_calls.size());
+                  loop.executed_calls.push_back(c);
+                  if (!write_tool_call(idx, c)) return false;
+
+                  ToolResult r;
+                  r.tool_call_id = c.id;
+                  r.name = c.name;
+
+                  if (!allowed_names.empty() && allowed_names.find(c.name) == allowed_names.end()) {
+                    r.ok = false;
+                    r.error = "tool not allowed";
+                    r.result = {{"ok", false}, {"error", r.error}};
+                    loop.results.push_back(r);
+                    exec_msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + r.result.dump()});
+                    tool_calls_used_local++;
+                    if (!write_tool_result(r)) return false;
+                    continue;
+                  }
+
+                  if (!tools_.HasTool(c.name)) {
+                    r.ok = false;
+                    r.error = "tool not found";
+                    r.result = {{"ok", false}, {"error", r.error}};
+                    loop.results.push_back(r);
+                    exec_msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + r.result.dump()});
+                    tool_calls_used_local++;
+                    if (!write_tool_result(r)) return false;
+                    continue;
+                  }
+
+                  ToolResult got_r;
+                  if (!execute_tool(c, s.arguments, &got_r)) return false;
+                  loop.results.push_back(got_r);
+                  exec_msgs.push_back({"user", "TOOL_RESULT " + c.name + " " + got_r.result.dump()});
+                  tool_calls_used_local++;
+                  if (!write_tool_result(got_r)) return false;
+                }
+
+                std::vector<ChatMessage> final_msgs;
+                final_msgs.reserve(exec_msgs.size() + 2);
+                final_msgs.push_back({"system", BuildPlannerFinalSystemPrompt()});
+                for (const auto& m : exec_msgs) final_msgs.push_back(m);
+
+                std::string final_text;
+                if (!run_chat_once(final_msgs, &final_text)) return false;
+                if (!err.empty() && final_text.empty()) return true;
+
+                loop.steps = 2;
+                if (auto final = ExtractFinalFromAssistantJson(final_text)) {
+                  loop.final_text = *final;
+                  return true;
+                }
+                loop.final_text = final_text;
+                return true;
+              };
+
+              if (!allowed_tools.empty()) {
+                if (planner) {
+                  if (!run_planner_stream()) return false;
+                  if (loop.planner_failed && err.empty()) {
+                    loop = ToolLoopResult();
+                    if (!run_tool_loop_stream()) return false;
+                  }
+                } else {
+                  if (!run_tool_loop_stream()) return false;
+                }
+              } else {
+                loop.final_text = FakeModelOnce(full_messages);
+              }
+            }
+
+            if (!err.empty() && loop.final_text.empty()) {
+              nlohmann::json delta;
+              delta["content"] = err;
+              write_chunk(delta, "stop");
+              write_bytes(SseDone());
+              sink.done();
+              return false;
             }
 
             constexpr size_t kTextChunk = 64;
             for (size_t off = 0; off < loop.final_text.size(); off += kTextChunk) {
               auto piece = loop.final_text.substr(off, kTextChunk);
               nlohmann::json delta;
-              if (!wrote_role) {
-                delta["role"] = "assistant";
-                wrote_role = true;
-              }
               delta["content"] = piece;
               if (!write_chunk(delta, nullptr)) {
                 sink.done();

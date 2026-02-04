@@ -230,6 +230,8 @@ class Handler(BaseHTTPRequestHandler):
                             content = '<tool_call>ide.search</arg_value>{"query":"OpenAiRouter","path":"src","max_results":3}</arg_value>'
                         if isinstance(msg, str) and "mock-toolcall:opencode" in msg:
                             content = '{"opencode":{"tool_calls":[{"name":"ide.search","arguments":{"query":"OpenAiRouter","path":"src","max_results":3}}]}}'
+                        if isinstance(msg, str) and "mock-toolcall:todowrite_cmd" in msg:
+                            content = 'todowrite status=pending steps=["a","b","c"]'
                         extra = []
                         if "temperature" in j:
                             extra.append(f"temp={j.get('temperature')}")
