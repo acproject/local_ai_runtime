@@ -1,5 +1,7 @@
 #include "openai_router.hpp"
 #include "config.hpp"
+#include "llama_agent/gbnf_generator.hpp"
+#include "llama_agent/tool_manager.hpp"
 #include "ollama_provider.hpp"
 
 #include <nlohmann/json.hpp>
@@ -423,15 +425,24 @@ static void NormalizeClientManagedToolCalls(const std::vector<ToolSchema>& tools
   };
 
   for (auto& c : *calls) {
+    const auto* schema = find_schema(c.name);
     auto j = ParseJsonLoose(c.arguments_json);
     if (!j) {
+      if (schema) {
+        auto key = guess_single_key(schema->parameters);
+        if (key && !key->empty()) {
+          nlohmann::json obj = nlohmann::json::object();
+          obj[*key] = c.arguments_json;
+          c.arguments_json = obj.dump();
+          continue;
+        }
+      }
       c.arguments_json = nlohmann::json(c.arguments_json).dump();
       continue;
     }
     if (!j->is_string()) continue;
 
     const auto raw = j->get<std::string>();
-    const auto* schema = find_schema(c.name);
     if (!schema) {
       c.arguments_json = nlohmann::json(raw).dump();
       continue;
@@ -530,6 +541,54 @@ static std::string BuildToolSystemPrompt(const std::vector<ToolSchema>& tools) {
   prompt += "Available tools spec:\n";
   prompt += spec.dump();
   return prompt;
+}
+
+static std::string BuildToolLoopGrammar(const std::vector<ToolSchema>& tools) {
+  std::vector<llama_agent::ToolDefinition> defs;
+  defs.reserve(tools.size());
+  for (const auto& t : tools) {
+    llama_agent::ToolDefinition d;
+    d.name = t.name;
+    d.description = t.description;
+    defs.push_back(std::move(d));
+  }
+
+  llama_agent::GrammarGenerator gen;
+  auto tool_part = gen.generateToolCallGrammar(defs);
+  if (!tool_part.has_value()) {
+    std::string g;
+    g += "root ::= ws (final_object | tool_calls_object) ws\n\n";
+    g += "final_object ::= \"{\" ws final_pair ws \"}\" ws\n";
+    g += "final_pair ::= \"\\\"final\\\"\" ws \":\" ws string\n\n";
+    g += "tool_calls_object ::= \"{\" ws tool_calls_pair ws \"}\" ws\n";
+    g += "tool_calls_pair ::= \"\\\"tool_calls\\\"\" ws \":\" ws tool_calls\n\n";
+    g += "tool_calls ::= \"[\" ws tool_call_list? \"]\" ws\n";
+    g += "tool_call_list ::= tool_call (\",\" ws tool_call)*\n";
+    g += "tool_call ::= \"{\" ws id_pair \",\" ws name_pair \",\" ws arguments_pair ws \"}\" ws\n";
+    g += "id_pair ::= \"\\\"id\\\"\" ws \":\" ws string\n";
+    g += "name_pair ::= \"\\\"name\\\"\" ws \":\" ws string\n";
+    g += "arguments_pair ::= \"\\\"arguments\\\"\" ws \":\" ws json_value\n\n";
+    g += R"(
+string ::= "\"" char* "\"" ws
+char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+number ::= ("-"? [0-9]+) ("." [0-9]+)? ([eE] [-+]? [0-9]+)? ws
+json_object ::= "{" ws (json_pair ("," ws json_pair)*)? "}" ws
+json_pair ::= string ":" ws json_value
+json_array ::= "[" ws (json_value ("," ws json_value)*)? "]" ws
+json_value ::= json_object | json_array | string | number | ("true" | "false" | "null") ws
+ws ::= [ \t\n]*
+)";
+    return g;
+  }
+
+  std::string g;
+  g += "root ::= ws (final_object | tool_calls_object) ws\n\n";
+  g += "final_object ::= \"{\" ws final_pair ws \"}\" ws\n";
+  g += "final_pair ::= \"\\\"final\\\"\" ws \":\" ws string\n\n";
+  g += "tool_calls_object ::= \"{\" ws tool_calls_pair ws \"}\" ws\n";
+  g += "tool_calls_pair ::= \"\\\"tool_calls\\\"\" ws \":\" ws tool_calls\n\n";
+  g += *tool_part;
+  return g;
 }
 
 static std::string BuildPlannerSystemPrompt(const std::vector<ToolSchema>& tools, int max_plan_steps) {
@@ -1093,6 +1152,9 @@ static ToolLoopResult RunToolLoop(const std::string& model,
       req.temperature = temperature;
       req.top_p = top_p;
       req.min_p = min_p;
+      if (provider && provider->Name() == "llama_cpp" && !allowed_tools.empty()) {
+        req.grammar = BuildToolLoopGrammar(allowed_tools);
+      }
       req.messages = msgs;
       auto resp = provider->ChatOnce(req, err);
       if (!resp) return out;
@@ -1997,6 +2059,9 @@ void OpenAiRouter::Register(httplib::Server* server) {
                   req.temperature = temperature;
                   req.top_p = top_p;
                   req.min_p = min_p;
+                  if (provider && provider->Name() == "llama_cpp" && !allowed_tools.empty()) {
+                    req.grammar = BuildToolLoopGrammar(allowed_tools);
+                  }
                   req.messages = messages;
                   auto resp = provider->ChatOnce(req, &local_err);
                   if (!resp) {

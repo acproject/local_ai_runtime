@@ -3,11 +3,16 @@
 #include <nlohmann/json.hpp>
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+namespace llama_agent {
+class ToolManager;
+}
 
 namespace runtime {
 
@@ -38,6 +43,7 @@ using ToolHandler = std::function<ToolResult(const std::string& tool_call_id, co
 class ToolRegistry {
  public:
   ToolRegistry() = default;
+  ~ToolRegistry();
   ToolRegistry(const ToolRegistry&) = delete;
   ToolRegistry& operator=(const ToolRegistry&) = delete;
   ToolRegistry(ToolRegistry&& other) noexcept;
@@ -55,6 +61,7 @@ class ToolRegistry {
   mutable std::shared_mutex mu_;
   std::unordered_map<std::string, ToolSchema> schemas_;
   std::unordered_map<std::string, ToolHandler> handlers_;
+  std::unique_ptr<llama_agent::ToolManager> tool_manager_;
 };
 
 ToolRegistry BuildDefaultToolRegistry(const RuntimeConfig& cfg);

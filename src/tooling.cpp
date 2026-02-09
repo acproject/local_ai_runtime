@@ -2,6 +2,8 @@
 
 #include "config.hpp"
 #include "session_manager.hpp"
+#include "llama_agent/tool_call_parser.hpp"
+#include "llama_agent/tool_manager.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -598,12 +600,47 @@ static nlohmann::json ErrorResult(const std::string& message) {
   return j;
 }
 
+static llama_agent::ToolDefinition ToAgentToolDefinition(const ToolSchema& schema) {
+  llama_agent::ToolDefinition def;
+  def.name = schema.name;
+  def.description = schema.description;
+  def.jsonSchema = {{"name", schema.name}, {"description", schema.description}, {"parameters", schema.parameters}};
+
+  if (schema.parameters.is_object()) {
+    std::unordered_set<std::string> required;
+    if (schema.parameters.contains("required") && schema.parameters["required"].is_array()) {
+      for (const auto& it : schema.parameters["required"]) {
+        if (it.is_string()) required.insert(it.get<std::string>());
+      }
+    }
+
+    if (schema.parameters.contains("properties") && schema.parameters["properties"].is_object()) {
+      for (const auto& [name, prop] : schema.parameters["properties"].items()) {
+        llama_agent::ToolParameter p;
+        p.name = name;
+        p.required = required.find(name) != required.end();
+        p.schema = prop;
+        if (prop.is_object()) {
+          if (prop.contains("type") && prop["type"].is_string()) p.type = prop["type"].get<std::string>();
+          if (prop.contains("description") && prop["description"].is_string()) p.description = prop["description"].get<std::string>();
+        }
+        def.parameters.push_back(std::move(p));
+      }
+    }
+  }
+
+  return def;
+}
+
 }  // namespace
+
+ToolRegistry::~ToolRegistry() = default;
 
 ToolRegistry::ToolRegistry(ToolRegistry&& other) noexcept {
   std::unique_lock<std::shared_mutex> lock(other.mu_);
   schemas_ = std::move(other.schemas_);
   handlers_ = std::move(other.handlers_);
+  tool_manager_ = std::move(other.tool_manager_);
 }
 
 ToolRegistry& ToolRegistry::operator=(ToolRegistry&& other) noexcept {
@@ -612,6 +649,7 @@ ToolRegistry& ToolRegistry::operator=(ToolRegistry&& other) noexcept {
   std::unique_lock<std::shared_mutex> lock_this(mu_);
   schemas_ = std::move(other.schemas_);
   handlers_ = std::move(other.handlers_);
+  tool_manager_ = std::move(other.tool_manager_);
   return *this;
 }
 
@@ -619,11 +657,30 @@ void ToolRegistry::RegisterTool(ToolSchema schema, ToolHandler handler) {
   std::unique_lock<std::shared_mutex> lock(mu_);
   const auto name = schema.name;
   schemas_[name] = std::move(schema);
-  handlers_[name] = std::move(handler);
+  handlers_[name] = handler;
+
+  if (!tool_manager_) tool_manager_ = std::make_unique<llama_agent::ToolManager>();
+  auto def = ToAgentToolDefinition(schemas_[name]);
+  tool_manager_->registerTool(def, [handler = std::move(handler), name](const nlohmann::json& arguments) mutable {
+    auto r = handler("call_0", arguments);
+    nlohmann::json out = r.result;
+    if (!out.is_object()) {
+      nlohmann::json wrap;
+      wrap["ok"] = r.ok;
+      wrap["result"] = out;
+      if (!r.ok && !r.error.empty()) wrap["error"] = r.error;
+      out = std::move(wrap);
+    } else {
+      if (!out.contains("ok")) out["ok"] = r.ok;
+      if (!r.ok && !out.contains("error") && !r.error.empty()) out["error"] = r.error;
+    }
+    return out;
+  });
 }
 
 bool ToolRegistry::HasTool(const std::string& name) const {
   std::shared_lock<std::shared_mutex> lock(mu_);
+  if (tool_manager_) return tool_manager_->hasTool(name);
   return schemas_.find(name) != schemas_.end() && handlers_.find(name) != handlers_.end();
 }
 
@@ -1774,6 +1831,33 @@ std::optional<nlohmann::json> ParseJsonLoose(const std::string& text) {
 }
 
 std::optional<std::vector<ToolCall>> ParseToolCallsFromAssistantText(const std::string& assistant_text) {
+  llama_agent::ToolCallParser parser;
+  auto parsed = parser.parse(assistant_text);
+  if (!parsed.empty()) {
+    std::vector<ToolCall> out;
+    out.reserve(parsed.size());
+    for (const auto& c : parsed) {
+      ToolCall rc;
+      rc.id = c.id;
+      rc.name = c.functionName;
+      if (c.arguments.is_string()) {
+        const auto s = c.arguments.get<std::string>();
+        if (ParseJsonLoose(s)) {
+          rc.arguments_json = s;
+        } else {
+          rc.arguments_json = nlohmann::json(s).dump();
+        }
+      } else if (c.arguments.is_null()) {
+        rc.arguments_json = "{}";
+      } else {
+        rc.arguments_json = c.arguments.dump();
+      }
+      if (rc.arguments_json.empty()) rc.arguments_json = "{}";
+      if (!rc.name.empty()) out.push_back(std::move(rc));
+    }
+    if (!out.empty()) return out;
+  }
+
   auto jopt = ParseJsonLoose(assistant_text);
   if (jopt) {
     if (auto from_json = ExtractToolCallsFromJson(*jopt)) return from_json;

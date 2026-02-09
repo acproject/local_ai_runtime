@@ -1,0 +1,33 @@
+# Build
+build/
+build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Model files
+*.gguf
+*.bin
+models/
+
+# Logs
+*.log
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+
+# Testing
+Testing/
+.cache

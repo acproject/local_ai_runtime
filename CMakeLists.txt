@@ -65,6 +65,9 @@ add_executable(local-ai-runtime
   src/openai_router.cpp
   src/session_manager.cpp
   src/tooling.cpp
+  extern/llama_cpp_agent/src/gbnf_generator.cpp
+  extern/llama_cpp_agent/src/tool_call_parser.cpp
+  extern/llama_cpp_agent/src/tool_manager.cpp
 )
 
 if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
@@ -74,14 +77,17 @@ if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
 endif()
 
 set_target_properties(local-ai-runtime PROPERTIES
-  CXX_STANDARD 20
+  CXX_STANDARD 23
   CXX_STANDARD_REQUIRED YES
   CXX_EXTENSIONS NO
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"
   PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"
 )
 
-target_include_directories(local-ai-runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(local-ai-runtime PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/extern/llama_cpp_agent/include
+)
 target_link_libraries(local-ai-runtime PRIVATE cpp-httplib nlohmann-json)
 
 if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)

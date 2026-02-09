@@ -828,6 +828,14 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   if (min_p > 0.0f && min_p < 1.0f) {
     llama_sampler_chain_add(sampler.get(), llama_sampler_init_min_p(min_p, 1));
   }
+  if (req.grammar.has_value() && !req.grammar->empty()) {
+    llama_sampler* g = llama_sampler_init_grammar(vocab, req.grammar->c_str(), "root");
+    if (!g) {
+      if (err) *err = "llama_cpp: failed to init grammar sampler";
+      return false;
+    }
+    llama_sampler_chain_add(sampler.get(), g);
+  }
   const bool has_sampling_filter = (top_p > 0.0f && top_p < 1.0f) || (min_p > 0.0f && min_p < 1.0f);
   if (temperature <= 0.0f && !has_sampling_filter) {
     llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());

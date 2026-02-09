@@ -22,6 +22,7 @@ struct ChatRequest {
   std::optional<float> temperature;
   std::optional<float> top_p;
   std::optional<float> min_p;
+  std::optional<std::string> grammar;
 };
 
 struct ChatResponse {
