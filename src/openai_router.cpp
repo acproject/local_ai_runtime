@@ -2050,25 +2050,31 @@ void OpenAiRouter::Register(httplib::Server* server) {
                 std::promise<std::pair<std::string, std::string>> p;
                 auto fut = p.get_future();
                 std::thread([=, p = std::move(p)]() mutable {
-                  ScopedRequestAuthHeaders scope(auth_headers);
-                  std::string local_err;
-                  ChatRequest req;
-                  req.model = provider_model;
-                  req.stream = false;
-                  req.max_tokens = max_tokens;
-                  req.temperature = temperature;
-                  req.top_p = top_p;
-                  req.min_p = min_p;
-                  if (provider && provider->Name() == "llama_cpp" && !allowed_tools.empty()) {
-                    req.grammar = BuildToolLoopGrammar(allowed_tools);
+                  try {
+                    ScopedRequestAuthHeaders scope(auth_headers);
+                    std::string local_err;
+                    ChatRequest req;
+                    req.model = provider_model;
+                    req.stream = false;
+                    req.max_tokens = max_tokens;
+                    req.temperature = temperature;
+                    req.top_p = top_p;
+                    req.min_p = min_p;
+                    if (provider && provider->Name() == "llama_cpp" && !allowed_tools.empty()) {
+                      req.grammar = BuildToolLoopGrammar(allowed_tools);
+                    }
+                    req.messages = messages;
+                    auto resp = provider->ChatOnce(req, &local_err);
+                    if (!resp) {
+                      p.set_value(std::make_pair(std::string(), local_err.empty() ? std::string("upstream error") : local_err));
+                      return;
+                    }
+                    p.set_value(std::make_pair(resp->content, std::string()));
+                  } catch (const std::exception& e) {
+                    p.set_value(std::make_pair(std::string(), std::string("exception: ") + e.what()));
+                  } catch (...) {
+                    p.set_value(std::make_pair(std::string(), std::string("exception: unknown")));
                   }
-                  req.messages = messages;
-                  auto resp = provider->ChatOnce(req, &local_err);
-                  if (!resp) {
-                    p.set_value(std::make_pair(std::string(), local_err.empty() ? std::string("upstream error") : local_err));
-                    return;
-                  }
-                  p.set_value(std::make_pair(resp->content, std::string()));
                 }).detach();
 
                 auto st = wait_ready(fut, model_timeout_s);
@@ -2103,9 +2109,32 @@ void OpenAiRouter::Register(httplib::Server* server) {
                 }
                 std::promise<ToolResult> p;
                 auto fut = p.get_future();
-                std::thread([&, p = std::move(p)]() mutable {
-                  ScopedRequestAuthHeaders scope(auth_headers);
-                  p.set_value((*handler)(c.id, jargs));
+                std::thread([p = std::move(p),
+                             handler = *handler,
+                             tool_call_id = c.id,
+                             tool_name = c.name,
+                             jargs = jargs,
+                             auth_headers = auth_headers]() mutable {
+                  try {
+                    ScopedRequestAuthHeaders scope(auth_headers);
+                    p.set_value(handler(tool_call_id, jargs));
+                  } catch (const std::exception& e) {
+                    ToolResult r;
+                    r.tool_call_id = tool_call_id;
+                    r.name = tool_name;
+                    r.ok = false;
+                    r.error = e.what();
+                    r.result = {{"ok", false}, {"error", r.error}};
+                    p.set_value(std::move(r));
+                  } catch (...) {
+                    ToolResult r;
+                    r.tool_call_id = tool_call_id;
+                    r.name = tool_name;
+                    r.ok = false;
+                    r.error = "unknown exception";
+                    r.result = {{"ok", false}, {"error", r.error}};
+                    p.set_value(std::move(r));
+                  }
                 }).detach();
 
                 auto st = wait_ready(fut, tool_timeout_s);

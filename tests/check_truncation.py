@@ -65,6 +65,7 @@ def _sse_chat_once(
     payload: Dict[str, Any],
     timeout_s: float,
     max_deltas: int = 0,
+    max_seconds: float = 0.0,
     extra_headers: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, Optional[str], Dict[str, str], int, bool]:
     u = urlparse(f"{base_url}/v1/chat/completions")
@@ -87,7 +88,10 @@ def _sse_chat_once(
     finish_reason: Optional[str] = None
     deltas = 0
     done = False
+    t0 = time.time()
     while True:
+        if max_seconds and max_seconds > 0 and (time.time() - t0) >= float(max_seconds):
+            break
         line = resp.readline()
         if not line:
             break
@@ -147,6 +151,11 @@ def run_one(
     prompt: str,
     timeout_s: float,
     stream_max_deltas: int,
+    stream_max_seconds: float,
+    require_done: bool,
+    tools: str,
+    max_steps: int,
+    max_tool_calls: int,
 ) -> None:
     system_prompt = _make_system_prompt_bytes(system_bytes)
     messages = [
@@ -157,12 +166,27 @@ def run_one(
         },
     ]
     payload: Dict[str, Any] = {"model": model, "messages": messages, "max_tokens": max_tokens}
+    tools_s = (tools or "").strip()
+    if tools_s:
+        payload["tools"] = [x.strip() for x in tools_s.split(",") if x.strip()]
+        if max_steps > 0:
+            payload["max_steps"] = int(max_steps)
+        if max_tool_calls > 0:
+            payload["max_tool_calls"] = int(max_tool_calls)
     if stream:
         payload["stream"] = True
-        text, fr, _, deltas, done = _sse_chat_once(base_url, payload, timeout_s=timeout_s, max_deltas=stream_max_deltas)
+        text, fr, _, deltas, done = _sse_chat_once(
+            base_url,
+            payload,
+            timeout_s=timeout_s,
+            max_deltas=stream_max_deltas,
+            max_seconds=stream_max_seconds,
+        )
         partial = False
         if stream_max_deltas > 0 and deltas >= stream_max_deltas and not done:
             partial = True
+        if require_done and not done:
+            raise RuntimeError("stream did not finish with [DONE]")
         print(
             json.dumps(
                 {
@@ -225,7 +249,12 @@ def main() -> int:
     ap.add_argument("--stream", action="store_true")
     ap.add_argument("--matrix", action="store_true")
     ap.add_argument("--stream-max-deltas", type=int, default=0)
+    ap.add_argument("--stream-max-seconds", type=float, default=0.0)
+    ap.add_argument("--require-done", action="store_true")
     ap.add_argument("--timeout-s", type=float, default=300.0)
+    ap.add_argument("--tools", default="")
+    ap.add_argument("--max-steps", type=int, default=0)
+    ap.add_argument("--max-tool-calls", type=int, default=0)
     ap.add_argument(
         "--prompt",
         default="Write a Markdown bullet list with 200 items. Each item must be ASCII and unique.",
@@ -292,6 +321,11 @@ def main() -> int:
                         args.prompt,
                         args.timeout_s,
                         args.stream_max_deltas,
+                        args.stream_max_seconds,
+                        args.require_done,
+                        args.tools,
+                        args.max_steps,
+                        args.max_tool_calls,
                     )
             return 0
 
@@ -304,6 +338,11 @@ def main() -> int:
             args.prompt,
             args.timeout_s,
             args.stream_max_deltas,
+            args.stream_max_seconds,
+            args.require_done,
+            args.tools,
+            args.max_steps,
+            args.max_tool_calls,
         )
         return 0
     finally:
