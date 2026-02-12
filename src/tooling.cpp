@@ -412,11 +412,32 @@ static std::optional<std::vector<ToolCall>> ExtractToolCallsFromTaggedText(const
     ToolCall c;
     c.id = NewId("call");
     c.name = name;
-    if (args_text.empty()) {
-      c.arguments_json = "{}";
+    if (!args_text.empty()) {
+      auto j = ParseJsonLoose(args_text);
+      if (j) {
+        c.arguments_json = j->dump();
+      } else {
+        auto raw = Trim(args_text);
+        if (auto lt = raw.find('<'); lt != std::string::npos) raw = Trim(raw.substr(0, lt));
+        if (!raw.empty() && c.name == "cat") {
+          auto raw_lower = raw;
+          for (auto& ch : raw_lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+          if (raw_lower.rfind("cat", 0) == 0) {
+            size_t p = 3;
+            while (p < raw.size() && std::isspace(static_cast<unsigned char>(raw[p]))) p++;
+            if (p < raw.size()) raw = Trim(raw.substr(p));
+          }
+          if (!raw.empty() && raw.front() == '`') raw = Trim(raw.substr(1));
+          while (!raw.empty() && (raw.back() == '`' || raw.back() == ';')) raw.pop_back();
+          raw = Trim(raw);
+        }
+        c.arguments_json = nlohmann::json(raw).dump();
+      }
     } else {
-      c.arguments_json = args_text;
+      c.arguments_json = "{}";
     }
+
+    if (c.name == "cat") c.name = "read";
     calls.push_back(std::move(c));
 
     pos = block_end;
@@ -582,6 +603,85 @@ static std::optional<std::vector<ToolCall>> ExtractToolCallsFromCommandText(cons
       ToolCall c;
       c.id = NewId("call");
       c.name = tool;
+      c.arguments_json = args.dump();
+      calls.push_back(std::move(c));
+    }
+
+    pos = after;
+  }
+
+  if (calls.empty()) return std::nullopt;
+  return calls;
+}
+
+static std::optional<std::vector<ToolCall>> ExtractToolCallsFromCatCommandText(const std::string& assistant_text) {
+  std::string lower;
+  lower.reserve(assistant_text.size());
+  for (char ch : assistant_text) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+
+  const std::string cmd = "cat";
+  std::vector<ToolCall> calls;
+
+  size_t pos = 0;
+  while (pos < lower.size()) {
+    size_t start = lower.find(cmd, pos);
+    if (start == std::string::npos) break;
+
+    const bool left_ok = (start == 0) || std::isspace(static_cast<unsigned char>(lower[start - 1])) || lower[start - 1] == '`' ||
+                         lower[start - 1] == ':';
+    const size_t after = start + cmd.size();
+    const bool right_ok = (after >= lower.size()) || std::isspace(static_cast<unsigned char>(lower[after])) || lower[after] == '`';
+    if (!left_ok || !right_ok) {
+      pos = after;
+      continue;
+    }
+
+    size_t p = after;
+    while (p < assistant_text.size() && std::isspace(static_cast<unsigned char>(assistant_text[p]))) p++;
+    if (p >= assistant_text.size()) {
+      pos = after;
+      continue;
+    }
+
+    std::string raw_path;
+    if (assistant_text[p] == '"' || assistant_text[p] == '\'') {
+      const char q = assistant_text[p++];
+      size_t vstart = p;
+      bool esc = false;
+      for (; p < assistant_text.size(); p++) {
+        const char c = assistant_text[p];
+        if (esc) {
+          esc = false;
+          continue;
+        }
+        if (c == '\\') {
+          esc = true;
+          continue;
+        }
+        if (c == q) break;
+      }
+      raw_path = assistant_text.substr(vstart, (p > vstart ? p - vstart : 0));
+      if (p < assistant_text.size() && assistant_text[p] == q) p++;
+    } else {
+      size_t vstart = p;
+      while (p < assistant_text.size() && !std::isspace(static_cast<unsigned char>(assistant_text[p])) && assistant_text[p] != ';' &&
+             assistant_text[p] != ',' && assistant_text[p] != '<' && assistant_text[p] != '`') {
+        p++;
+      }
+      raw_path = assistant_text.substr(vstart, p - vstart);
+    }
+
+    auto path = Trim(raw_path);
+    if (auto lt = path.find('<'); lt != std::string::npos) path = Trim(path.substr(0, lt));
+    while (!path.empty() && (path.back() == '`' || path.back() == ';' || path.back() == ',')) path.pop_back();
+    path = Trim(path);
+
+    if (!path.empty()) {
+      ToolCall c;
+      c.id = NewId("call");
+      c.name = "read";
+      nlohmann::json args = nlohmann::json::object();
+      args["filePath"] = path;
       c.arguments_json = args.dump();
       calls.push_back(std::move(c));
     }
@@ -1863,7 +1963,8 @@ std::optional<std::vector<ToolCall>> ParseToolCallsFromAssistantText(const std::
     if (auto from_json = ExtractToolCallsFromJson(*jopt)) return from_json;
   }
   if (auto tagged = ExtractToolCallsFromTaggedText(assistant_text)) return tagged;
-  return ExtractToolCallsFromCommandText(assistant_text);
+  if (auto cmd = ExtractToolCallsFromCommandText(assistant_text)) return cmd;
+  return ExtractToolCallsFromCatCommandText(assistant_text);
 }
 
 }  // namespace runtime

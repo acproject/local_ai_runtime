@@ -50,7 +50,7 @@ if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
   FetchContent_Declare(
     llama_cpp
     GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-    GIT_TAG b7822
+    GIT_TAG b8003
     GIT_SHALLOW TRUE
   )
   FetchContent_MakeAvailable(llama_cpp)
