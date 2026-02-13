@@ -19,6 +19,9 @@
 namespace runtime {
 namespace {
 
+static std::vector<std::string> ParseRequestedToolNames(const nlohmann::json& j);
+static bool ToolsContainFullSchemas(const nlohmann::json& j);
+
 static int64_t NowSeconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
@@ -33,6 +36,30 @@ static std::string ToLowerAscii(std::string s) {
     if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
   }
   return s;
+}
+
+static bool ShouldUseObjectToolArguments(const httplib::Request& req, const nlohmann::json& j) {
+  auto mode = ToLowerAscii(GetEnvStr("RUNTIME_TOOL_ARGUMENTS_MODE"));
+  if (mode == "object" || mode == "obj") return true;
+  if (mode == "string" || mode == "str") return false;
+
+  auto ua = ToLowerAscii(req.get_header_value("User-Agent"));
+  if (!ua.empty() && ua.find("opencode") != std::string::npos) return true;
+  auto x_client = ToLowerAscii(req.get_header_value("x-client"));
+  if (!x_client.empty() && x_client.find("opencode") != std::string::npos) return true;
+  auto x_opencode = ToLowerAscii(req.get_header_value("x-opencode"));
+  if (!x_opencode.empty() && x_opencode != "0" && x_opencode != "false" && x_opencode != "off") return true;
+  if (j.contains("opencode") && j["opencode"].is_boolean() && j["opencode"].get<bool>()) return true;
+
+  if (ToolsContainFullSchemas(j)) {
+    auto names = ParseRequestedToolNames(j);
+    for (const auto& n : names) {
+      if (n.rfind("ide.", 0) == 0) return true;
+      if (n == "writeFile" || n == "editFile" || n == "todowrite") return true;
+    }
+  }
+
+  return false;
 }
 
 static bool IsGlmFamilyModel(const std::string& model) {
@@ -390,10 +417,30 @@ static std::string BuildToolSystemPromptClientManaged(const std::vector<ToolSche
   return prompt;
 }
 
-static nlohmann::json BuildOpenAiToolCalls(const std::vector<ToolCall>& calls) {
+static nlohmann::json BuildOpenAiToolCalls(const std::vector<ToolCall>& calls, bool arguments_as_object) {
   nlohmann::json out = nlohmann::json::array();
   for (const auto& c : calls) {
-    out.push_back({{"id", c.id}, {"type", "function"}, {"function", {{"name", c.name}, {"arguments", c.arguments_json}}}});
+    nlohmann::json args = c.arguments_json;
+    if (arguments_as_object) {
+      auto j1 = ParseJsonLoose(c.arguments_json);
+      if (j1) {
+        if (j1->is_object()) {
+          args = *j1;
+        } else if (j1->is_string()) {
+          auto j2 = ParseJsonLoose(j1->get<std::string>());
+          if (j2 && j2->is_object()) {
+            args = *j2;
+          } else {
+            args = nlohmann::json::object({{"input", j1->get<std::string>()}});
+          }
+        } else {
+          args = nlohmann::json::object({{"input", j1->dump()}});
+        }
+      } else {
+        args = nlohmann::json::object({{"input", c.arguments_json}});
+      }
+    }
+    out.push_back({{"id", c.id}, {"type", "function"}, {"function", {{"name", c.name}, {"arguments", std::move(args)}}}});
   }
   return out;
 }
@@ -1431,6 +1478,8 @@ void OpenAiRouter::Register(httplib::Server* server) {
       full_messages = req_messages;
     }
 
+    const bool tool_arguments_as_object = ShouldUseObjectToolArguments(req, j);
+
     bool stream = false;
     if (j.contains("stream") && j["stream"].is_boolean()) stream = j["stream"].get<bool>();
     std::optional<int> max_tokens;
@@ -1555,7 +1604,11 @@ void OpenAiRouter::Register(httplib::Server* server) {
           out["choices"] = nlohmann::json::array();
           nlohmann::json choice;
           choice["index"] = 0;
-          choice["message"] = {{"role", "assistant"}, {"content", nullptr}, {"tool_calls", BuildOpenAiToolCalls(*calls)}};
+          choice["message"] = {
+              {"role", "assistant"},
+              {"content", nullptr},
+              {"tool_calls", BuildOpenAiToolCalls(*calls, tool_arguments_as_object)},
+          };
           choice["finish_reason"] = "tool_calls";
           out["choices"].push_back(std::move(choice));
           out["usage"] = {{"prompt_tokens", nullptr}, {"completion_tokens", nullptr}, {"total_tokens", nullptr}};
@@ -1723,25 +1776,58 @@ void OpenAiRouter::Register(httplib::Server* server) {
               }
 
               if (calls) {
-                constexpr size_t kArgChunk = 48;
                 for (size_t i = 0; i < calls->size(); i++) {
                   const auto& c = (*calls)[i];
-                  std::string args = c.arguments_json.empty() ? "{}" : c.arguments_json;
-                  for (size_t off = 0; off < args.size(); off += kArgChunk) {
-                    const bool first_piece = (off == 0);
+                  if (tool_arguments_as_object) {
+                    nlohmann::json args = nlohmann::json::object();
+                    auto j1 = ParseJsonLoose(c.arguments_json);
+                    if (j1) {
+                      if (j1->is_object()) {
+                        args = *j1;
+                      } else if (j1->is_string()) {
+                        auto j2 = ParseJsonLoose(j1->get<std::string>());
+                        if (j2 && j2->is_object()) {
+                          args = *j2;
+                        } else {
+                          args = nlohmann::json::object({{"input", j1->get<std::string>()}});
+                        }
+                      } else {
+                        args = nlohmann::json::object({{"input", j1->dump()}});
+                      }
+                    } else {
+                      args = nlohmann::json::object({{"input", c.arguments_json}});
+                    }
+
                     nlohmann::json tool_delta;
                     nlohmann::json tc;
                     tc["index"] = static_cast<int>(i);
                     tc["id"] = c.id;
                     tc["type"] = "function";
-                    nlohmann::json func;
-                    if (first_piece) func["name"] = c.name;
-                    func["arguments"] = args.substr(off, kArgChunk);
-                    tc["function"] = std::move(func);
+                    tc["function"] = {{"name", c.name}, {"arguments", std::move(args)}};
                     tool_delta["tool_calls"] = nlohmann::json::array({tc});
                     if (!write_chunk(tool_delta, nullptr)) {
                       sink.done();
                       return false;
+                    }
+                  } else {
+                    constexpr size_t kArgChunk = 48;
+                    std::string args = c.arguments_json.empty() ? "{}" : c.arguments_json;
+                    for (size_t off = 0; off < args.size(); off += kArgChunk) {
+                      const bool first_piece = (off == 0);
+                      nlohmann::json tool_delta;
+                      nlohmann::json tc;
+                      tc["index"] = static_cast<int>(i);
+                      tc["id"] = c.id;
+                      tc["type"] = "function";
+                      nlohmann::json func;
+                      if (first_piece) func["name"] = c.name;
+                      func["arguments"] = args.substr(off, kArgChunk);
+                      tc["function"] = std::move(func);
+                      tool_delta["tool_calls"] = nlohmann::json::array({tc});
+                      if (!write_chunk(tool_delta, nullptr)) {
+                        sink.done();
+                        return false;
+                      }
                     }
                   }
                 }

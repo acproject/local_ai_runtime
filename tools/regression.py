@@ -9,6 +9,8 @@ import threading
 import time
 import urllib.request
 import urllib.error
+from http.client import HTTPConnection
+from urllib.parse import urlparse
 
 
 def http_json(url, payload, headers=None):
@@ -350,7 +352,8 @@ def main():
             assert j.get("servers") == 1
             assert j.get("registered", 0) >= 5
 
-            tool_spec = [
+            tool_spec_names = [{"type": "function", "function": {"name": "ide.search"}}]
+            tool_spec_full = [
                 {
                     "type": "function",
                     "function": {
@@ -368,12 +371,60 @@ def main():
                 }
             ]
 
+            def sse_expect_tool_arguments_object(base_url: str, payload: dict, headers: dict):
+                u = urlparse(f"{base_url}/v1/chat/completions")
+                conn = HTTPConnection(u.hostname, u.port, timeout=10)
+                body = json.dumps(payload).encode("utf-8", errors="replace")
+                h = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+                if headers:
+                    h.update(headers)
+                conn.request("POST", u.path, body=body, headers=h)
+                resp = conn.getresponse()
+                raw = resp.read().decode("utf-8", errors="replace") if resp.status < 200 or resp.status >= 300 else ""
+                if raw:
+                    conn.close()
+                    raise AssertionError(f"sse request failed: http {resp.status}: {raw[:500]}")
+                seen = None
+                try:
+                    while True:
+                        line = resp.readline()
+                        if not line:
+                            break
+                        s = line.decode("utf-8", errors="replace").strip()
+                        if not s.startswith("data:"):
+                            continue
+                        data = s[len("data:") :].strip()
+                        if data == "[DONE]":
+                            break
+                        j = json.loads(data)
+                        choices = j.get("choices") if isinstance(j, dict) else None
+                        if not isinstance(choices, list) or not choices:
+                            continue
+                        delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+                        if not isinstance(delta, dict):
+                            continue
+                        tc = delta.get("tool_calls")
+                        if not isinstance(tc, list) or not tc:
+                            continue
+                        fn = tc[0].get("function") if isinstance(tc[0], dict) else None
+                        if not isinstance(fn, dict):
+                            continue
+                        seen = fn.get("arguments")
+                        break
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                if not isinstance(seen, dict):
+                    raise AssertionError(f"expected tool function.arguments as object, got {type(seen)} {seen!r}")
+
             for trigger in ["mock-toolcall:tag", "mock-toolcall:weirdtag", "mock-toolcall:opencode"]:
                 payload = {
                     "model": "mock-model",
                     "trace": True,
                     "messages": [{"role": "user", "content": trigger}],
-                    "tools": tool_spec,
+                    "tools": tool_spec_names,
                 }
                 st, headers, body = http_json(f"http://127.0.0.1:{args.runtime_port}/v1/chat/completions", payload)
                 assert st == 200
@@ -400,6 +451,17 @@ def main():
                     for m in (sess.get("history") or [])
                 )
 
+            sse_expect_tool_arguments_object(
+                f"http://127.0.0.1:{args.runtime_port}",
+                {
+                    "model": "mock-model",
+                    "messages": [{"role": "user", "content": "mock-toolcall:opencode"}],
+                    "tools": tool_spec_full,
+                    "stream": True,
+                },
+                {"User-Agent": "opencode"},
+            )
+
             payload = {
                 "model": "mock-model",
                 "trace": True,
@@ -423,7 +485,6 @@ def main():
                         "type": "function",
                         "function": {
                             "name": "ide.read_file",
-                            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
                         },
                     }
                 ],
@@ -442,15 +503,6 @@ def main():
                         "type": "function",
                         "function": {
                             "name": "ide.hover",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "uri": {"type": "string"},
-                                    "line": {"type": "integer"},
-                                    "character": {"type": "integer"},
-                                },
-                                "required": ["uri", "line", "character"],
-                            },
                         },
                     }
                 ],
