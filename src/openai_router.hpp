@@ -2,7 +2,6 @@
 
 #include "providers/registry.hpp"
 #include "session_manager.hpp"
-#include "tooling.hpp"
 
 #include <httplib.h>
 
@@ -12,14 +11,12 @@ namespace runtime {
 
 class OpenAiRouter {
  public:
-  OpenAiRouter(SessionManager* sessions, ProviderRegistry* providers, ToolRegistry tools);
+  OpenAiRouter(SessionManager* sessions, ProviderRegistry* providers);
   void Register(httplib::Server* server);
-  ToolRegistry* MutableTools();
 
  private:
   SessionManager* sessions_;
   ProviderRegistry* providers_;
-  ToolRegistry tools_;
 };
 
 }  // namespace runtime

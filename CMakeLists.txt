@@ -59,15 +59,10 @@ endif()
 add_executable(local-ai-runtime
   src/config.cpp
   src/main.cpp
-  src/mcp_client.cpp
   src/openai_compatible_http_provider.cpp
   src/ollama_provider.cpp
   src/openai_router.cpp
   src/session_manager.cpp
-  src/tooling.cpp
-  extern/llama_cpp_agent/src/gbnf_generator.cpp
-  extern/llama_cpp_agent/src/tool_call_parser.cpp
-  extern/llama_cpp_agent/src/tool_manager.cpp
 )
 
 if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
@@ -86,7 +81,6 @@ set_target_properties(local-ai-runtime PROPERTIES
 
 target_include_directories(local-ai-runtime PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/extern/llama_cpp_agent/include
 )
 target_link_libraries(local-ai-runtime PRIVATE cpp-httplib nlohmann-json)
 
