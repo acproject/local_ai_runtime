@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "providers/provider.hpp"
 
+#include <mutex>
 #include <string>
 
 namespace runtime {
@@ -10,6 +11,8 @@ namespace runtime {
 class OpenAiCompatibleHttpProvider : public IProvider {
  public:
   OpenAiCompatibleHttpProvider(std::string name, HttpEndpoint endpoint);
+
+  void Stop() override;
 
   std::string Name() const override;
   std::vector<ModelInfo> ListModels(std::string* err) override;
@@ -23,6 +26,8 @@ class OpenAiCompatibleHttpProvider : public IProvider {
  private:
   std::string name_;
   HttpEndpoint endpoint_;
+  std::mutex mu_;
+  std::string last_model_;
 };
 
 }  // namespace runtime

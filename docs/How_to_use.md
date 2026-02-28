@@ -61,7 +61,7 @@ $env:MCP_HOST="http://127.0.0.1:9000";`
 
 ### 编译
 LOCAL_AI_RUNTIME_WITH_LLAMA_CPP=ON
-cmake -S . -B build-vs2022-x64-cuda -DLOCAL_AI_RUNTIME_WITH_LLAMA_CPP=ON
+cmake -S . -B build-vs2022-x64-cuda -DLOCAL_AI_RUNTIME_WITH_LLAMA_CPP=ON -DLOCAL_AI_RUNTIME_LLAMA_CUDA=ON
 cmake --build build-vs2022-x64-cuda --config Release
 
 ### API的使用方式

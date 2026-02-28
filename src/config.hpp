@@ -33,8 +33,10 @@ struct RuntimeConfig {
   HttpEndpoint ollama;
   HttpEndpoint mnn;
   HttpEndpoint lmdeploy;
+  HttpEndpoint vllm;
   bool mnn_enabled = false;
   bool lmdeploy_enabled = false;
+  bool vllm_enabled = false;
   HttpEndpoint mcp;
   bool mcp_enabled = false;
   std::vector<HttpEndpoint> mcp_hosts;

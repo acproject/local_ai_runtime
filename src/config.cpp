@@ -144,6 +144,12 @@ RuntimeConfig LoadConfigFromEnv() {
     cfg.lmdeploy_enabled = true;
   }
 
+  auto vllm = GetEnvStr("VLLM_HOST");
+  if (!vllm.empty()) {
+    cfg.vllm = ParseHttpEndpoint(vllm, 58000);
+    cfg.vllm_enabled = true;
+  }
+
   auto mcp = GetEnvStr("MCP_HOST");
   if (!mcp.empty()) {
     cfg.mcp = ParseHttpEndpoint(mcp, 9000);

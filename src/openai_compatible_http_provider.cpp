@@ -3,12 +3,22 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 
 namespace runtime {
 namespace {
+
+static bool StartsWith(const std::string& s, const std::string& prefix) {
+  return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+static bool EndsWith(const std::string& s, const std::string& suffix) {
+  return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
 
 static std::unique_ptr<httplib::Client> MakeClient(const HttpEndpoint& ep) {
   auto cli = std::make_unique<httplib::Client>(ep.host, ep.port);
@@ -28,15 +38,51 @@ static std::unique_ptr<httplib::Client> MakeClient(const HttpEndpoint& ep) {
 
 static std::string JoinPath(const std::string& base, const std::string& path) {
   if (base.empty()) return path;
-  if (base.back() == '/' && !path.empty() && path.front() == '/') return base + path.substr(1);
-  if (base.back() != '/' && !path.empty() && path.front() != '/') return base + "/" + path;
-  return base + path;
+
+  std::string b = base;
+  std::string p = path;
+
+  if (EndsWith(b, "/v1/")) b.pop_back();
+  if (EndsWith(b, "/v1") && StartsWith(p, "/v1/")) p = p.substr(3);
+
+  if (p.empty()) return b;
+  if (b.back() == '/' && p.front() == '/') return b + p.substr(1);
+  if (b.back() != '/' && p.front() != '/') return b + "/" + p;
+  return b + p;
 }
 
 }  // namespace
 
 OpenAiCompatibleHttpProvider::OpenAiCompatibleHttpProvider(std::string name, HttpEndpoint endpoint)
     : name_(std::move(name)), endpoint_(std::move(endpoint)) {}
+
+void OpenAiCompatibleHttpProvider::Stop() {
+  if (name_ != "vllm") return;
+
+  const char* env_path = std::getenv("VLLM_STOP_PATH");
+  if (!env_path || env_path[0] == '\0') env_path = std::getenv("VLLM_UNLOAD_PATH");
+  if (!env_path || env_path[0] == '\0') return;
+
+  std::string model;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    model = last_model_;
+    last_model_.clear();
+  }
+
+  std::string path = env_path;
+  if (!path.empty() && path.front() != '/') path = "/" + path;
+
+  auto cli = MakeClient(endpoint_);
+  nlohmann::json j = nlohmann::json::object();
+  if (!model.empty()) j["model"] = model;
+  auto res = cli->Post(JoinPath(endpoint_.base_path, path), j.dump(), "application/json");
+  if (!res) {
+    std::cout << "[vllm] stop request failed model=" << model << "\n";
+    return;
+  }
+  std::cout << "[vllm] stop request status=" << res->status << " model=" << model << "\n";
+}
 
 std::string OpenAiCompatibleHttpProvider::Name() const {
   return name_;
@@ -73,6 +119,10 @@ std::vector<ModelInfo> OpenAiCompatibleHttpProvider::ListModels(std::string* err
 std::optional<std::vector<double>> OpenAiCompatibleHttpProvider::Embeddings(const std::string& model,
                                                                             const std::string& input,
                                                                             std::string* err) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    last_model_ = model;
+  }
   auto cli = MakeClient(endpoint_);
   nlohmann::json j;
   j["model"] = model;
@@ -100,6 +150,10 @@ std::optional<std::vector<double>> OpenAiCompatibleHttpProvider::Embeddings(cons
 }
 
 std::optional<ChatResponse> OpenAiCompatibleHttpProvider::ChatOnce(const ChatRequest& req, std::string* err) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    last_model_ = req.model;
+  }
   auto cli = MakeClient(endpoint_);
   nlohmann::json j;
   j["model"] = req.model;
