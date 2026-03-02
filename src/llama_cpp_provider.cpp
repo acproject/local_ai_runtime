@@ -346,19 +346,41 @@ LlamaCppProvider::LlamaCppProvider(std::string model_path) : model_root_(std::mo
       model_root_ = fallback.string();
     }
   }
+  {
+    int32_t n = 0;
+    if (TryParseInt32(TrimWs(GetEnvStr("LLAMA_CPP_MAX_SESSIONS")), &n) && n > 0) {
+      max_sessions_ = static_cast<size_t>(std::min<int32_t>(n, 256));
+    }
+  }
+  default_session_ = std::make_shared<SessionState>();
   BuildModelIndex();
 }
 
 LlamaCppProvider::~LlamaCppProvider() {
-  std::lock_guard<std::mutex> lock(mu_);
-  if (ctx_) {
-    llama_free(ctx_);
-    ctx_ = nullptr;
-  }
-  if (model_) {
-    llama_model_free(model_);
+  std::vector<std::shared_ptr<SessionState>> to_free;
+  llama_model* model = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    to_free.reserve(sessions_.size() + 1);
+    if (default_session_) to_free.push_back(default_session_);
+    for (auto& it : sessions_) to_free.push_back(it.second.state);
+    sessions_.clear();
+    lru_.clear();
+    default_session_.reset();
+    std::unique_lock<std::shared_mutex> mlock(model_mu_);
+    model = model_;
     model_ = nullptr;
+    loaded_model_path_.clear();
   }
+  for (auto& s : to_free) {
+    if (!s) continue;
+    std::lock_guard<std::mutex> sl(s->mu);
+    if (s->ctx) {
+      llama_free(s->ctx);
+      s->ctx = nullptr;
+    }
+  }
+  if (model) llama_model_free(model);
 }
 
 void LlamaCppProvider::Start() {
@@ -367,16 +389,30 @@ void LlamaCppProvider::Start() {
 }
 
 void LlamaCppProvider::Stop() {
-  std::lock_guard<std::mutex> lock(mu_);
-  if (ctx_) {
-    llama_free(ctx_);
-    ctx_ = nullptr;
-  }
-  if (model_) {
-    llama_model_free(model_);
+  std::vector<std::shared_ptr<SessionState>> to_free;
+  llama_model* model = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    to_free.reserve(sessions_.size() + 1);
+    if (default_session_) to_free.push_back(default_session_);
+    for (auto& it : sessions_) to_free.push_back(it.second.state);
+    sessions_.clear();
+    lru_.clear();
+    default_session_ = std::make_shared<SessionState>();
+    std::unique_lock<std::shared_mutex> mlock(model_mu_);
+    model = model_;
     model_ = nullptr;
+    loaded_model_path_.clear();
   }
-  loaded_model_path_.clear();
+  for (auto& s : to_free) {
+    if (!s) continue;
+    std::lock_guard<std::mutex> sl(s->mu);
+    if (s->ctx) {
+      llama_free(s->ctx);
+      s->ctx = nullptr;
+    }
+  }
+  if (model) llama_model_free(model);
 }
 
 std::string LlamaCppProvider::Name() const {
@@ -496,12 +532,24 @@ std::optional<std::string> LlamaCppProvider::ResolveModelPath(const std::string&
 }
 
 bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* err) {
-  if (model_ && ctx_ && loaded_model_path_ == model_path) return true;
+  if (model_ && loaded_model_path_ == model_path) return true;
 
-  if (ctx_) {
-    llama_free(ctx_);
-    ctx_ = nullptr;
-  }
+  auto free_state = [&](const std::shared_ptr<SessionState>& s) {
+    if (!s) return;
+    std::lock_guard<std::mutex> sl(s->mu);
+    if (s->ctx) {
+      llama_free(s->ctx);
+      s->ctx = nullptr;
+    }
+    s->tokens.clear();
+    s->n_ctx = 0;
+  };
+  free_state(default_session_);
+  for (auto& it : sessions_) free_state(it.second.state);
+  sessions_.clear();
+  lru_.clear();
+  if (!default_session_) default_session_ = std::make_shared<SessionState>();
+
   if (model_) {
     llama_model_free(model_);
     model_ = nullptr;
@@ -617,6 +665,22 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
     }
     return false;
   }
+  loaded_model_path_ = model_path;
+  return true;
+}
+
+bool LlamaCppProvider::EnsureContext(SessionState* s, std::string* err) {
+  if (!s) {
+    if (err) *err = "llama_cpp: missing session state";
+    return false;
+  }
+  if (s->ctx) return true;
+  if (!model_) {
+    if (err) *err = "llama_cpp: model not loaded";
+    return false;
+  }
+
+  const auto cfg = LoadLlamaRuntimeConfigFromEnv();
 
   llama_context_params cparams = llama_context_default_params();
   cparams.n_ctx = cfg.n_ctx.has_value() ? cfg.n_ctx.value() : 4096;
@@ -633,12 +697,13 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
   } else if (gpu_defaults) {
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
   }
-  ctx_ = llama_init_from_model(model_, cparams);
-  if (!ctx_) {
+
+  s->ctx = llama_init_from_model(model_, cparams);
+  if (!s->ctx) {
     if (err) *err = "llama_cpp: failed to create context";
     return false;
   }
-  loaded_model_path_ = model_path;
+  s->n_ctx = llama_n_ctx(s->ctx);
   return true;
 }
 
@@ -700,12 +765,68 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
                                   const std::function<bool(const std::string&)>& on_delta,
                                   const std::function<void(const std::string& finish_reason)>& on_done,
                                   std::string* err) {
-  std::lock_guard<std::mutex> lock(mu_);
-  auto model_path = ResolveModelPath(req.model, err);
-  if (!model_path) return false;
-  if (!EnsureLoaded(*model_path, err)) return false;
+  std::shared_ptr<SessionState> session;
+  std::vector<std::shared_ptr<SessionState>> evicted_states;
+  std::shared_lock<std::shared_mutex> model_lock;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto model_path = ResolveModelPath(req.model, err);
+    if (!model_path) return false;
 
-  llama_memory_clear(llama_get_memory(ctx_), false);
+    std::unique_lock<std::shared_mutex> mlock(model_mu_);
+    if (!EnsureLoaded(*model_path, err)) return false;
+    mlock.unlock();
+    model_lock = std::shared_lock<std::shared_mutex>(model_mu_);
+
+    std::string sid;
+    if (req.session_id.has_value() && !req.session_id->empty()) sid = *req.session_id;
+    if (sid.empty()) {
+      if (!default_session_) default_session_ = std::make_shared<SessionState>();
+      session = default_session_;
+    } else {
+      auto it = sessions_.find(sid);
+      if (it == sessions_.end()) {
+        auto state = std::make_shared<SessionState>();
+        lru_.push_front(sid);
+        SessionEntry e;
+        e.state = state;
+        e.lru_it = lru_.begin();
+        sessions_.emplace(sid, std::move(e));
+        session = std::move(state);
+      } else {
+        lru_.erase(it->second.lru_it);
+        lru_.push_front(sid);
+        it->second.lru_it = lru_.begin();
+        session = it->second.state;
+      }
+      while (sessions_.size() > max_sessions_) {
+        const std::string drop_id = lru_.back();
+        lru_.pop_back();
+        auto dit = sessions_.find(drop_id);
+        if (dit == sessions_.end()) continue;
+        evicted_states.push_back(dit->second.state);
+        sessions_.erase(dit);
+      }
+    }
+  }
+  for (const auto& evicted : evicted_states) {
+    if (!evicted) continue;
+    std::lock_guard<std::mutex> sl(evicted->mu);
+    if (evicted->ctx) {
+      llama_free(evicted->ctx);
+      evicted->ctx = nullptr;
+    }
+    evicted->tokens.clear();
+    evicted->n_ctx = 0;
+  }
+  if (!session) {
+    if (err) *err = "llama_cpp: missing session";
+    return false;
+  }
+
+  std::unique_lock<std::mutex> session_lock(session->mu);
+  if (!EnsureContext(session.get(), err)) return false;
+  llama_context* ctx = session->ctx;
 
   std::string prompt;
   bool used_chat_template = false;
@@ -760,7 +881,6 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   }
   prompt_tokens.resize(static_cast<size_t>(n_tok));
 
-  const uint32_t n_ctx = llama_n_ctx(ctx_);
   const auto gen_cfg = LoadLlamaRuntimeConfigFromEnv();
   int max_new_tokens_requested = gen_cfg.max_new_tokens.has_value() ? gen_cfg.max_new_tokens.value() : 2048;
   if (req.max_tokens.has_value() && req.max_tokens.value() > 0) {
@@ -776,6 +896,8 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
     min_p = 0.01f;
   }
   const int32_t seed = gen_cfg.seed.has_value() ? gen_cfg.seed.value() : static_cast<int32_t>(LLAMA_DEFAULT_SEED);
+
+  const uint32_t n_ctx = session->n_ctx > 0 ? session->n_ctx : llama_n_ctx(ctx);
 
   if (n_ctx > 0) {
     size_t reserve = 0;
@@ -852,14 +974,29 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   }
 
   llama_batch last_batch{};
-  const uint32_t n_batch_u = llama_n_batch(ctx_);
+  const uint32_t n_batch_u = llama_n_batch(ctx);
   const size_t n_batch = n_batch_u > 0 ? static_cast<size_t>(n_batch_u) : 512;
+  bool reset_session = false;
+  size_t prefix = 0;
+  if (llama_model_has_encoder(model_)) {
+    reset_session = true;
+  } else {
+    while (prefix < session->tokens.size() && prefix < prompt_tokens.size() && session->tokens[prefix] == prompt_tokens[prefix]) {
+      prefix++;
+    }
+    if (prefix < session->tokens.size()) reset_session = true;
+  }
+  if (reset_session) {
+    llama_memory_clear(llama_get_memory(ctx), false);
+    session->tokens.clear();
+    prefix = 0;
+  }
   if (llama_model_has_encoder(model_)) {
     for (size_t start = 0; start < prompt_tokens.size();) {
       const size_t chunk = std::min(n_batch, prompt_tokens.size() - start);
       llama_batch batch = llama_batch_get_one(prompt_tokens.data() + start, static_cast<int32_t>(chunk));
       batch.logits = nullptr;
-      const int32_t rc = llama_encode(ctx_, batch);
+      const int32_t rc = llama_encode(ctx, batch);
       if (rc != 0) {
         if (err) *err = "llama_cpp: encode failed (code " + std::to_string(rc) + ")";
         return false;
@@ -873,17 +1010,17 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
     token_buf[0] = decoder_start_token_id;
     last_batch = llama_batch_get_one(token_buf.data(), 1);
     last_batch.logits = nullptr;
-    const int32_t rc = llama_decode(ctx_, last_batch);
+    const int32_t rc = llama_decode(ctx, last_batch);
     if (rc != 0) {
       if (err) *err = "llama_cpp: decode failed (code " + std::to_string(rc) + ")";
       return false;
     }
   } else {
-    for (size_t start = 0; start < prompt_tokens.size();) {
+    for (size_t start = prefix; start < prompt_tokens.size();) {
       const size_t chunk = std::min(n_batch, prompt_tokens.size() - start);
       llama_batch batch = llama_batch_get_one(prompt_tokens.data() + start, static_cast<int32_t>(chunk));
       batch.logits = nullptr;
-      const int32_t rc = llama_decode(ctx_, batch);
+      const int32_t rc = llama_decode(ctx, batch);
       if (rc != 0) {
         if (err) *err = "llama_cpp: decode failed (code " + std::to_string(rc) + ")";
         return false;
@@ -914,9 +1051,9 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   };
   for (int i = 0; i < max_new_tokens; i++) {
     const int32_t sample_i = std::max<int32_t>(0, last_batch.n_tokens - 1);
-    llama_token next = llama_sampler_sample(sampler.get(), ctx_, sample_i);
+    llama_token next = llama_sampler_sample(sampler.get(), ctx, sample_i);
     if (i == 0 && emit_buf.empty() && out_acc.empty() && n_vocab > 0 && llama_vocab_is_eog(vocab, next)) {
-      float* logits = llama_get_logits_ith(ctx_, sample_i);
+      float* logits = llama_get_logits_ith(ctx, sample_i);
       if (logits) {
         std::vector<std::pair<llama_token, float>> suppressed;
         suppressed.reserve(8);
@@ -927,7 +1064,7 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
           } else {
             break;
           }
-          next = llama_sampler_sample(sampler.get(), ctx_, sample_i);
+          next = llama_sampler_sample(sampler.get(), ctx, sample_i);
         }
         for (const auto& it : suppressed) {
           const llama_token tok = it.first;
@@ -999,7 +1136,7 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
         break;
       }
     }
-    const int32_t rc = llama_decode(ctx_, last_batch);
+    const int32_t rc = llama_decode(ctx, last_batch);
     if (rc != 0) {
       if (err) *err = "llama_cpp: decode failed (code " + std::to_string(rc) + ")";
       return false;
@@ -1015,17 +1152,13 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
             << " gen_tokens=" << gen_tokens.size() << " n_ctx=" << n_ctx << " max_new_tokens=" << max_new_tokens << "\n";
   on_done(finish_reason);
 
-  if (gen_cfg.unload_after_chat.has_value() && gen_cfg.unload_after_chat.value()) {
-    if (ctx_) {
-      llama_free(ctx_);
-      ctx_ = nullptr;
-    }
-    if (model_) {
-      llama_model_free(model_);
-      model_ = nullptr;
-    }
-    loaded_model_path_.clear();
-  }
+  session->tokens = prompt_tokens;
+  session->tokens.insert(session->tokens.end(), gen_tokens.begin(), gen_tokens.end());
+
+  const bool unload_after_chat = gen_cfg.unload_after_chat.has_value() && gen_cfg.unload_after_chat.value();
+  session_lock.unlock();
+  model_lock.unlock();
+  if (unload_after_chat) Stop();
 
   return true;
 }

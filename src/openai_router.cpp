@@ -439,6 +439,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
       } else {
         ChatRequest creq;
         creq.model = provider_model;
+        creq.session_id = session_id;
         creq.stream = false;
         creq.max_tokens = max_tokens;
         creq.temperature = temperature;
@@ -553,6 +554,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
             } else {
               ChatRequest creq;
               creq.model = provider_model;
+              creq.session_id = session_id;
               creq.stream = true;
               creq.max_tokens = max_tokens;
               creq.temperature = temperature;
@@ -705,6 +707,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
         } else {
           ChatRequest creq;
           creq.model = provider_model;
+          creq.session_id = session_id;
           creq.stream = false;
           creq.max_tokens = max_tokens;
           creq.temperature = temperature;
@@ -770,6 +773,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
         } else {
           ChatRequest creq;
           creq.model = provider_model;
+          creq.session_id = session_id;
           creq.stream = false;
           creq.max_tokens = max_tokens;
           creq.temperature = temperature;
@@ -842,6 +846,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
       } else {
         ChatRequest creq;
         creq.model = provider_model;
+        creq.session_id = session_id;
         creq.stream = false;
         creq.max_tokens = max_tokens;
         creq.temperature = temperature;
@@ -1006,6 +1011,7 @@ void OpenAiRouter::Register(httplib::Server* server) {
     if (allowed_tools.empty() && model != "fake-tool") {
       ChatRequest creq;
       creq.model = provider_model;
+      creq.session_id = session_id;
       creq.stream = true;
       creq.max_tokens = max_tokens;
       creq.temperature = temperature;

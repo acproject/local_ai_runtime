@@ -9,26 +9,58 @@ option(LOCAL_AI_RUNTIME_LLAMA_CUDA "Enable CUDA backend for llama.cpp (NVIDIA)" 
 option(LOCAL_AI_RUNTIME_LLAMA_VULKAN "Enable Vulkan backend for llama.cpp" OFF)
 set(LOCAL_AI_RUNTIME_CUDA_ARCHITECTURES "" CACHE STRING "CMake CUDA architectures for ggml-cuda (e.g. 86-real;89-real). Empty = safe default")
 
-set(LOCAL_AI_RUNTIME_VENDORED_HTTPLIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp-agent/extern/cpp-httplib")
-if(EXISTS "${LOCAL_AI_RUNTIME_VENDORED_HTTPLIB_DIR}/httplib.h")
-  add_library(cpp-httplib INTERFACE)
-  target_include_directories(cpp-httplib INTERFACE "${LOCAL_AI_RUNTIME_VENDORED_HTTPLIB_DIR}")
-else()
-  FetchContent_Declare(
-    cpp_httplib
-    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-    GIT_TAG v0.15.3
-    GIT_SHALLOW TRUE
+if(NOT LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
+  set(LOCAL_AI_RUNTIME_VENDORED_HTTPLIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp-agent/extern/cpp-httplib")
+  set(LOCAL_AI_RUNTIME_CACHED_HTTPLIB_DIRS
+    "${CMAKE_CURRENT_SOURCE_DIR}/build-trae/_deps/cpp_httplib-src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/build-vs2022-x64-cuda/_deps/cpp_httplib-src"
   )
-  FetchContent_Populate(cpp_httplib)
-  add_library(cpp-httplib INTERFACE)
-  target_include_directories(cpp-httplib INTERFACE ${cpp_httplib_SOURCE_DIR})
+  set(LOCAL_AI_RUNTIME_HTTPLIB_INCLUDE_DIR "")
+  if(EXISTS "${LOCAL_AI_RUNTIME_VENDORED_HTTPLIB_DIR}/httplib.h")
+    set(LOCAL_AI_RUNTIME_HTTPLIB_INCLUDE_DIR "${LOCAL_AI_RUNTIME_VENDORED_HTTPLIB_DIR}")
+  else()
+    foreach(dir IN LISTS LOCAL_AI_RUNTIME_CACHED_HTTPLIB_DIRS)
+      if(EXISTS "${dir}/httplib.h")
+        set(LOCAL_AI_RUNTIME_HTTPLIB_INCLUDE_DIR "${dir}")
+        break()
+      endif()
+    endforeach()
+  endif()
+  if(NOT LOCAL_AI_RUNTIME_HTTPLIB_INCLUDE_DIR STREQUAL "")
+    add_library(cpp-httplib INTERFACE)
+    target_include_directories(cpp-httplib INTERFACE "${LOCAL_AI_RUNTIME_HTTPLIB_INCLUDE_DIR}")
+  else()
+    FetchContent_Declare(
+      cpp_httplib
+      GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+      GIT_TAG v0.15.3
+      GIT_SHALLOW TRUE
+    )
+    FetchContent_Populate(cpp_httplib)
+    add_library(cpp-httplib INTERFACE)
+    target_include_directories(cpp-httplib INTERFACE ${cpp_httplib_SOURCE_DIR})
+  endif()
 endif()
 
 set(LOCAL_AI_RUNTIME_VENDORED_NLOHMANN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp-agent/extern/json/include")
+set(LOCAL_AI_RUNTIME_CACHED_NLOHMANN_DIRS
+  "${CMAKE_CURRENT_SOURCE_DIR}/build-vs2022-x64-cuda/_deps/nlohmann_json-src"
+  "${CMAKE_CURRENT_SOURCE_DIR}/build-vs2022-x64-cuda/_deps/llama_cpp-src/vendor"
+)
+set(LOCAL_AI_RUNTIME_NLOHMANN_INCLUDE_DIR "")
 if(EXISTS "${LOCAL_AI_RUNTIME_VENDORED_NLOHMANN_DIR}/nlohmann/json.hpp")
+  set(LOCAL_AI_RUNTIME_NLOHMANN_INCLUDE_DIR "${LOCAL_AI_RUNTIME_VENDORED_NLOHMANN_DIR}")
+else()
+  foreach(dir IN LISTS LOCAL_AI_RUNTIME_CACHED_NLOHMANN_DIRS)
+    if(EXISTS "${dir}/nlohmann/json.hpp")
+      set(LOCAL_AI_RUNTIME_NLOHMANN_INCLUDE_DIR "${dir}")
+      break()
+    endif()
+  endforeach()
+endif()
+if(NOT LOCAL_AI_RUNTIME_NLOHMANN_INCLUDE_DIR STREQUAL "")
   add_library(nlohmann-json INTERFACE)
-  target_include_directories(nlohmann-json INTERFACE "${LOCAL_AI_RUNTIME_VENDORED_NLOHMANN_DIR}")
+  target_include_directories(nlohmann-json INTERFACE "${LOCAL_AI_RUNTIME_NLOHMANN_INCLUDE_DIR}")
 else()
   FetchContent_Declare(
     nlohmann_json
@@ -57,13 +89,26 @@ if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
     set(GGML_VULKAN ON CACHE BOOL "" FORCE)
   endif()
 
-  FetchContent_Declare(
-    llama_cpp
-    GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-    GIT_TAG b8179
-    GIT_SHALLOW TRUE
+  set(LOCAL_AI_RUNTIME_LLAMA_CPP_SOURCE_CANDIDATES
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp-agent/third_party/llama.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/build/_deps/llama_cpp-src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/build-vs2022-x64-cuda/_deps/llama_cpp-src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/build-trae/_deps/llama_cpp-src"
   )
-  FetchContent_MakeAvailable(llama_cpp)
+  set(LOCAL_AI_RUNTIME_LLAMA_CPP_SOURCE_DIR "")
+  foreach(dir IN LISTS LOCAL_AI_RUNTIME_LLAMA_CPP_SOURCE_CANDIDATES)
+    if(EXISTS "${dir}/CMakeLists.txt")
+      set(LOCAL_AI_RUNTIME_LLAMA_CPP_SOURCE_DIR "${dir}")
+      break()
+    endif()
+  endforeach()
+
+  if(LOCAL_AI_RUNTIME_LLAMA_CPP_SOURCE_DIR STREQUAL "")
+    message(FATAL_ERROR "llama.cpp source not found. Initialize third_party/llama.cpp-agent submodules or provide a local llama.cpp checkout.")
+  endif()
+
+  set(LLAMA_CPP_SOURCE_DIR_OVERRIDE "${LOCAL_AI_RUNTIME_LLAMA_CPP_SOURCE_DIR}" CACHE PATH "" FORCE)
+  add_subdirectory(third_party/llama.cpp-agent)
 endif()
 
 add_executable(local-ai-runtime

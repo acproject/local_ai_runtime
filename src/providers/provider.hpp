@@ -16,6 +16,7 @@ struct ModelInfo {
 
 struct ChatRequest {
   std::string model;
+  std::optional<std::string> session_id;
   std::vector<ChatMessage> messages;
   bool stream = false;
   std::optional<int> max_tokens;

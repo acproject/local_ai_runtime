@@ -2,8 +2,11 @@
 
 #include "providers/provider.hpp"
 
+#include <list>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -35,6 +38,19 @@ class LlamaCppProvider : public IProvider {
   void BuildModelIndex();
   std::optional<std::string> ResolveModelPath(const std::string& requested_model, std::string* err) const;
   bool EnsureLoaded(const std::string& model_path, std::string* err);
+  struct SessionState {
+    std::mutex mu;
+    llama_context* ctx = nullptr;
+    std::vector<int32_t> tokens;
+    uint32_t n_ctx = 0;
+  };
+
+  struct SessionEntry {
+    std::shared_ptr<SessionState> state;
+    std::list<std::string>::iterator lru_it;
+  };
+
+  bool EnsureContext(SessionState* s, std::string* err);
   std::string BuildPrompt(const std::vector<ChatMessage>& messages) const;
 
   std::string model_root_;
@@ -43,9 +59,13 @@ class LlamaCppProvider : public IProvider {
   std::vector<std::string> model_ids_;
 
   mutable std::mutex mu_;
+  mutable std::shared_mutex model_mu_;
   std::string loaded_model_path_;
+  size_t max_sessions_ = 16;
   llama_model* model_ = nullptr;
-  llama_context* ctx_ = nullptr;
+  std::shared_ptr<SessionState> default_session_;
+  std::list<std::string> lru_;
+  std::unordered_map<std::string, SessionEntry> sessions_;
 };
 
 }  // namespace runtime
