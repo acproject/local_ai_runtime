@@ -9,41 +9,39 @@ option(LOCAL_AI_RUNTIME_LLAMA_CUDA "Enable CUDA backend for llama.cpp (NVIDIA)" 
 option(LOCAL_AI_RUNTIME_LLAMA_VULKAN "Enable Vulkan backend for llama.cpp" OFF)
 set(LOCAL_AI_RUNTIME_CUDA_ARCHITECTURES "" CACHE STRING "CMake CUDA architectures for ggml-cuda (e.g. 86-real;89-real). Empty = safe default")
 
-set(LOCAL_AI_RUNTIME_VENDORED_HTTPLIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/llama_cpp_agent/extern/cpp-httplib")
+set(LOCAL_AI_RUNTIME_VENDORED_HTTPLIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp-agent/extern/cpp-httplib")
 if(EXISTS "${LOCAL_AI_RUNTIME_VENDORED_HTTPLIB_DIR}/httplib.h")
   add_library(cpp-httplib INTERFACE)
   target_include_directories(cpp-httplib INTERFACE "${LOCAL_AI_RUNTIME_VENDORED_HTTPLIB_DIR}")
 else()
   FetchContent_Declare(
     cpp_httplib
-    URL https://raw.githubusercontent.com/yhirose/cpp-httplib/v0.15.3/httplib.h
-    DOWNLOAD_NO_EXTRACT TRUE
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG v0.15.3
+    GIT_SHALLOW TRUE
   )
   FetchContent_Populate(cpp_httplib)
   add_library(cpp-httplib INTERFACE)
   target_include_directories(cpp-httplib INTERFACE ${cpp_httplib_SOURCE_DIR})
 endif()
 
-set(LOCAL_AI_RUNTIME_VENDORED_NLOHMANN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/llama_cpp_agent/extern/json/include")
+set(LOCAL_AI_RUNTIME_VENDORED_NLOHMANN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp-agent/extern/json/include")
 if(EXISTS "${LOCAL_AI_RUNTIME_VENDORED_NLOHMANN_DIR}/nlohmann/json.hpp")
   add_library(nlohmann-json INTERFACE)
   target_include_directories(nlohmann-json INTERFACE "${LOCAL_AI_RUNTIME_VENDORED_NLOHMANN_DIR}")
 else()
   FetchContent_Declare(
     nlohmann_json
-    URL https://raw.githubusercontent.com/nlohmann/json/v3.11.3/single_include/nlohmann/json.hpp
-    DOWNLOAD_NO_EXTRACT TRUE
-    DOWNLOAD_NAME json.hpp
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+    GIT_SHALLOW TRUE
   )
   FetchContent_Populate(nlohmann_json)
-  file(MAKE_DIRECTORY ${nlohmann_json_SOURCE_DIR}/nlohmann)
-  configure_file(
-    ${nlohmann_json_SOURCE_DIR}/json.hpp
-    ${nlohmann_json_SOURCE_DIR}/nlohmann/json.hpp
-    COPYONLY
-  )
   add_library(nlohmann-json INTERFACE)
-  target_include_directories(nlohmann-json INTERFACE ${nlohmann_json_SOURCE_DIR})
+  target_include_directories(nlohmann-json INTERFACE
+    ${nlohmann_json_SOURCE_DIR}
+    ${nlohmann_json_SOURCE_DIR}/single_include
+  )
 endif()
 
 if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
