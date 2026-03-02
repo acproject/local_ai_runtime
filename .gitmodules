@@ -1,0 +1,3 @@
+[submodule "third_party/llama.cpp-agent"]
+	path = third_party/llama.cpp-agent
+	url = git@github.com:acproject/llama.cpp-agent.git
