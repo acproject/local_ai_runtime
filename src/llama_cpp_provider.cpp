@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <deque>
 #include <cstring>
 #include <filesystem>
@@ -583,14 +584,24 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
 
   static llama_model_kv_override deepseek2_overrides[2]{};
   deepseek2_overrides[0].tag = LLAMA_KV_OVERRIDE_TYPE_FLOAT;
+#ifdef _WIN32
   strncpy_s(deepseek2_overrides[0].key, sizeof(deepseek2_overrides[0].key), "deepseek2.rope.scaling.yarn_log_multiplier", _TRUNCATE);
+#else
+  std::snprintf(deepseek2_overrides[0].key, sizeof(deepseek2_overrides[0].key), "%s",
+                "deepseek2.rope.scaling.yarn_log_multiplier");
+#endif
   deepseek2_overrides[0].val_f64 = 0.0;
   deepseek2_overrides[1].key[0] = 0;
 
   static llama_model_kv_override glm4_tokpre_overrides[2]{};
   glm4_tokpre_overrides[0].tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+#ifdef _WIN32
   strncpy_s(glm4_tokpre_overrides[0].key, sizeof(glm4_tokpre_overrides[0].key), "tokenizer.ggml.pre", _TRUNCATE);
   strncpy_s(glm4_tokpre_overrides[0].val_str, sizeof(glm4_tokpre_overrides[0].val_str), "chatglm-bpe", _TRUNCATE);
+#else
+  std::snprintf(glm4_tokpre_overrides[0].key, sizeof(glm4_tokpre_overrides[0].key), "%s", "tokenizer.ggml.pre");
+  std::snprintf(glm4_tokpre_overrides[0].val_str, sizeof(glm4_tokpre_overrides[0].val_str), "%s", "chatglm-bpe");
+#endif
   glm4_tokpre_overrides[1].key[0] = 0;
 
   static llama_model_kv_override deepseek2_and_glm4_overrides[3]{};
