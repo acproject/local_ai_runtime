@@ -146,7 +146,10 @@ RuntimeConfig LoadConfigFromEnv() {
 
   auto vllm = GetEnvStr("VLLM_HOST");
   if (!vllm.empty()) {
-    cfg.vllm = ParseHttpEndpoint(vllm, 58000);
+    cfg.vllm = ParseHttpEndpoint(vllm, 8000);
+    cfg.vllm_enabled = true;
+  } else if (ToLower(cfg.default_provider) == "vllm") {
+    cfg.vllm = ParseHttpEndpoint("http://127.0.0.1:8000", 8000);
     cfg.vllm_enabled = true;
   }
 

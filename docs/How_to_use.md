@@ -80,6 +80,7 @@ export RUNTIME_PROVIDER='llama_cpp'
 export LLAMA_CPP_MODEL='/path/to/llm_models'
 export OLLAMA_HOST='http://127.0.0.1:11434'
 export LMDEPLOY_HOST='http://127.0.0.1:23333'
+export VLLM_HOST='http://127.0.0.1:58000'
 export NO_PROXY='127.0.0.1,localhost'
 export no_proxy='127.0.0.1,localhost'
 
@@ -109,6 +110,7 @@ export RUNTIME_LISTEN_HOST='127.0.0.1'
 export RUNTIME_LISTEN_PORT='18081'
 export RUNTIME_PROVIDER='llama_cpp'
 export LLAMA_CPP_MODEL='/path/to/llm_models'
+export VLLM_HOST='http://127.0.0.1:58000'
 export NO_PROXY='127.0.0.1,localhost'
 export no_proxy='127.0.0.1,localhost'
 export LLAMA_CPP_N_CTX='8192'
@@ -164,7 +166,7 @@ Authorization: Bearer <token>
 
 `/v1/models` 返回的 `data[].id` 可能带 provider 前缀：
 
-- `ollama:<id>` / `lmdeploy:<id>` / `mnn:<id>` / `llama_cpp:<id>`
+- `ollama:<id>` / `lmdeploy:<id>` / `mnn:<id>` / `vllm:<id>` / `llama_cpp:<id>`
 
 也可能不带前缀（表示 runtime 的默认 provider，由 `RUNTIME_PROVIDER` 决定）。opencode 侧应当直接使用返回的 `id` 原样作为请求里的 `model`。
 
