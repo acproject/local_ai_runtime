@@ -59,6 +59,80 @@ $env:MCP_HOST="http://127.0.0.1:9000";`
 & 'D:\workspace\cpp_projects\local_ai_runtime\build-vs2022-x64-cuda\bin\Release\local-ai-runtime.exe'
 ```
 
+### 在linux下使用
+- 启动单个 Provider（示例：lmdeploy）
+```bash
+export RUNTIME_LISTEN_HOST='127.0.0.1'
+export RUNTIME_LISTEN_PORT='18080'
+export RUNTIME_PROVIDER='lmdeploy'
+export LMDEPLOY_HOST='http://127.0.0.1:23333'
+export NO_PROXY='127.0.0.1,localhost'
+export no_proxy='127.0.0.1,localhost'
+
+./build/bin/Release/local-ai-runtime
+```
+
+- 启动多个 Provider（示例：llama_cpp + ollama + lmdeploy）
+```bash
+export RUNTIME_LISTEN_HOST='127.0.0.1'
+export RUNTIME_LISTEN_PORT='18081'
+export RUNTIME_PROVIDER='llama_cpp'
+export LLAMA_CPP_MODEL='/path/to/llm_models'
+export OLLAMA_HOST='http://127.0.0.1:11434'
+export LMDEPLOY_HOST='http://127.0.0.1:23333'
+export NO_PROXY='127.0.0.1,localhost'
+export no_proxy='127.0.0.1,localhost'
+
+./build/bin/Release/local-ai-runtime
+```
+
+* 注意 RUNTIME_LISTEN_PORT 一定要和 CloudToLocal 本地 local_agent.exe 里的 `--openai=http://127.0.0.1:<port>` 端口一致
+
+* 注意如果使用本地服务，还需要下面的设置：
+```bash
+export LLAMA_CPP_FLASH_ATTN="disabled"
+export LLAMA_CPP_N_BATCH="256"
+export LLAMA_CPP_N_UBATCH="128"
+```
+
+* 轻量GPU辅助（CPU为主，GPU为辅）建议：
+```bash
+export LLAMA_CPP_N_GPU_LAYERS="8"
+export LLAMA_CPP_OFFLOAD_KQV="0"
+export LLAMA_CPP_N_BATCH="128"
+export LLAMA_CPP_N_UBATCH="64"
+```
+
+* 完整的使用方法
+```bash
+export RUNTIME_LISTEN_HOST='127.0.0.1'
+export RUNTIME_LISTEN_PORT='18081'
+export RUNTIME_PROVIDER='llama_cpp'
+export LLAMA_CPP_MODEL='/path/to/llm_models'
+export NO_PROXY='127.0.0.1,localhost'
+export no_proxy='127.0.0.1,localhost'
+export LLAMA_CPP_N_CTX='8192'
+export LLAMA_CPP_MAX_NEW_TOKENS='512'
+export LLAMA_CPP_FLASH_ATTN='disabled'
+export LLAMA_CPP_N_BATCH='256'
+export LLAMA_CPP_N_UBATCH='128'
+export LLAMA_CPP_TEMPERATURE='0.7'
+export LLAMA_CPP_TOP_P='0.9'
+export LLAMA_CPP_SEED='42'
+export LLAMA_CPP_N_GPU_LAYERS='12'
+export LLAMA_CPP_OFFLOAD_KQV='0'
+export RUNTIME_SESSION_STORE_TYPE='minimemory'
+export RUNTIME_SESSION_STORE_ENDPOINT='http://127.0.0.1:6379'
+export RUNTIME_SESSION_STORE_PASSWORD=''
+export RUNTIME_SESSION_STORE_DB='0'
+export RUNTIME_SESSION_STORE_RESET_ON_BOOT='true'
+# 若跨重启共享历史，启用稳定命名空间；否则不要设置此变量
+# export RUNTIME_SESSION_STORE_NAMESPACE='stable'
+export MCP_HOST='http://127.0.0.1:9000'
+
+./build/bin/Release/local-ai-runtime
+```
+
 ### 编译
 LOCAL_AI_RUNTIME_WITH_LLAMA_CPP=ON
 cmake -S . -B build-vs2022-x64-cuda -DLOCAL_AI_RUNTIME_WITH_LLAMA_CPP=ON -DLOCAL_AI_RUNTIME_LLAMA_CUDA=ON
