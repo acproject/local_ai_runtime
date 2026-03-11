@@ -128,6 +128,9 @@ if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
     message(FATAL_ERROR "llama.cpp source not found. Provide LOCAL_AI_RUNTIME_LLAMA_CPP_SOURCE_DIR, initialize third_party/llama.cpp-agent submodules, or enable LOCAL_AI_RUNTIME_FETCH_LLAMA_CPP.")
   endif()
 
+  # Enable building common library for jinja chat template support
+  set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
+
   add_subdirectory("${LOCAL_AI_RUNTIME_LLAMA_CPP_FOUND_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/llama_cpp")
 
   if(LOCAL_AI_RUNTIME_USE_LLAMA_CPP_AGENT)

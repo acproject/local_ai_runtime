@@ -60,6 +60,11 @@ $env:MCP_HOST="http://127.0.0.1:9000";`
 ```
 
 ### 在linux下使用
+```sh
+cd /home/acproject/workspace/cpp_projects/local_ai_runtime/build
+cmake .. -DLOCAL_AI_RUNTIME_CUDA_ARCHITECTURES="70-real;75-real;80-real;86-real"
+make -j$(nproc)
+```
 - 启动单个 Provider（示例：lmdeploy）
 ```bash
 export RUNTIME_LISTEN_HOST='127.0.0.1'
