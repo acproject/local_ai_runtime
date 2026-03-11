@@ -47,6 +47,12 @@ int main() {
   if (cfg.lmdeploy_enabled) providers.Register(std::make_unique<runtime::OpenAiCompatibleHttpProvider>("lmdeploy", cfg.lmdeploy));
   if (cfg.vllm_enabled) providers.Register(std::make_unique<runtime::OpenAiCompatibleHttpProvider>("vllm", cfg.vllm));
   if (cfg.agent_server_enabled) providers.Register(std::make_unique<runtime::AgentServerProvider>(cfg.agent_server));
+  
+  // Activate default provider to initialize it (calls Start() method)
+  if (!cfg.default_provider.empty()) {
+    providers.Activate(cfg.default_provider);
+  }
+  
   runtime::OpenAiRouter router(&sessions, &providers);
 
   std::cout << "[runtime] default_provider=" << cfg.default_provider << "\n";

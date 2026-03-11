@@ -69,11 +69,6 @@ static std::unique_ptr<httplib::Client> MakeClient(const HttpEndpoint& ep) {
   return cli;
 }
 
-static std::string GetEnvStr(const char* name) {
-  const char* v = std::getenv(name);
-  return v ? std::string(v) : std::string();
-}
-
 static std::string ToLower(std::string s) {
   for (auto& c : s) {
     if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
@@ -81,142 +76,13 @@ static std::string ToLower(std::string s) {
   return s;
 }
 
-}  // namespace
+// Parse SSE events from OpenAI streaming format
+struct SseEvent {
+  std::string event_type;
+  std::string data;
+};
 
-AgentServerProvider::AgentServerProvider(HttpEndpoint endpoint)
-    : endpoint_(std::move(endpoint)) {
-  std::cout << "[agent_server] initialized with endpoint " 
-            << endpoint_.scheme << "://" << endpoint_.host 
-            << ":" << endpoint_.port << endpoint_.base_path << "\n";
-}
-
-AgentServerProvider::~AgentServerProvider() {
-  Stop();
-}
-
-void AgentServerProvider::Start() {
-  std::string err;
-  server_available_ = CheckHealth(&err);
-  if (server_available_) {
-    std::cout << "[agent_server] server is available\n";
-  } else {
-    std::cout << "[agent_server] server not available: " << err << "\n";
-  }
-}
-
-void AgentServerProvider::Stop() {
-  std::lock_guard<std::mutex> lock(mu_);
-  session_map_.clear();
-  default_agent_session_.clear();
-  server_available_ = false;
-}
-
-std::string AgentServerProvider::Name() const {
-  return "agent_server";
-}
-
-bool AgentServerProvider::CheckHealth(std::string* err) {
-  auto cli = MakeClient(endpoint_);
-  auto res = cli->Get(JoinPath(endpoint_.base_path, "/health"));
-  if (!res) {
-    if (err) *err = "failed to connect to agent server";
-    return false;
-  }
-  if (res->status < 200 || res->status >= 300) {
-    if (err) *err = "health check returned status " + std::to_string(res->status);
-    return false;
-  }
-  auto j = nlohmann::json::parse(res->body, nullptr, false);
-  if (j.is_discarded()) {
-    if (err) *err = "invalid JSON from health check";
-    return false;
-  }
-  // Health endpoint returns {"status": "ok"}
-  if (j.contains("status") && j["status"].is_string()) {
-    return j["status"].get<std::string>() == "ok";
-  }
-  return true;
-}
-
-std::vector<ModelInfo> AgentServerProvider::ListModels(std::string* err) {
-  // Agent server doesn't have a /v1/models endpoint
-  // We return a single model entry to indicate the service is available
-  if (!server_available_) {
-    if (err) *err = "agent server not available";
-    return {};
-  }
-  
-  std::vector<ModelInfo> out;
-  ModelInfo m;
-  m.id = "agent";
-  m.owned_by = "agent_server";
-  out.push_back(std::move(m));
-  return out;
-}
-
-std::optional<std::vector<double>> AgentServerProvider::Embeddings(
-    const std::string&, const std::string&, std::string* err) {
-  if (err) *err = "agent_server: embeddings not supported";
-  return std::nullopt;
-}
-
-std::optional<std::string> AgentServerProvider::CreateSession(std::string* err) {
-  auto cli = MakeClient(endpoint_);
-  
-  // Create session with optional configuration
-  nlohmann::json body = nlohmann::json::object();
-  
-  // Read agent session config from environment
-  std::string yolo_mode = GetEnvStr("AGENT_YOLO_MODE");
-  if (!yolo_mode.empty()) {
-    body["yolo"] = (ToLower(yolo_mode) == "true" || yolo_mode == "1");
-  }
-  
-  std::string working_dir = GetEnvStr("AGENT_WORKING_DIR");
-  if (!working_dir.empty()) {
-    body["working_dir"] = working_dir;
-  }
-  
-  std::string enable_skills = GetEnvStr("AGENT_ENABLE_SKILLS");
-  if (!enable_skills.empty()) {
-    body["enable_skills"] = (ToLower(enable_skills) == "true" || enable_skills == "1");
-  }
-  
-  // Subagent configuration
-  std::string max_subagent_depth = GetEnvStr("AGENT_MAX_SUBAGENT_DEPTH");
-  if (!max_subagent_depth.empty()) {
-    try {
-      int depth = std::stoi(max_subagent_depth);
-      // Clamp to valid range: 0-5
-      if (depth < 0) depth = 0;
-      if (depth > 5) depth = 5;
-      body["max_subagent_depth"] = depth;
-    } catch (...) {
-      // Invalid number, ignore
-    }
-  }
-  
-  auto res = cli->Post(JoinPath(endpoint_.base_path, "/v1/agent/session"), 
-                       body.dump(), "application/json");
-  if (!res) {
-    if (err) *err = "failed to connect to agent server for session creation";
-    return std::nullopt;
-  }
-  if (res->status < 200 || res->status >= 300) {
-    if (err) *err = "session creation returned status " + std::to_string(res->status);
-    return std::nullopt;
-  }
-  
-  auto j = nlohmann::json::parse(res->body, nullptr, false);
-  if (j.is_discarded() || !j.contains("session_id") || !j["session_id"].is_string()) {
-    if (err) *err = "invalid JSON from session creation";
-    return std::nullopt;
-  }
-  
-  return j["session_id"].get<std::string>();
-}
-
-std::vector<AgentServerProvider::SseEvent> AgentServerProvider::ParseSseEvents(const std::string& chunk) {
+static std::vector<SseEvent> ParseSseEvents(const std::string& chunk) {
   std::vector<SseEvent> events;
   std::istringstream ss(chunk);
   std::string line;
@@ -252,107 +118,217 @@ std::vector<AgentServerProvider::SseEvent> AgentServerProvider::ParseSseEvents(c
   return events;
 }
 
+}  // namespace
+
+AgentServerProvider::AgentServerProvider(HttpEndpoint endpoint)
+    : endpoint_(std::move(endpoint)) {
+  std::cout << "[agent_server] initialized with endpoint " 
+            << endpoint_.scheme << "://" << endpoint_.host 
+            << ":" << endpoint_.port << endpoint_.base_path << "\n";
+}
+
+AgentServerProvider::~AgentServerProvider() {
+  Stop();
+}
+
+void AgentServerProvider::Start() {
+  std::string err;
+  server_available_ = CheckHealth(&err);
+  if (server_available_) {
+    std::cout << "[agent_server] server is available\n";
+  } else {
+    std::cout << "[agent_server] server not available: " << err << "\n";
+  }
+}
+
+void AgentServerProvider::Stop() {
+  server_available_ = false;
+}
+
+std::string AgentServerProvider::Name() const {
+  return "agent_server";
+}
+
+bool AgentServerProvider::CheckHealth(std::string* err) {
+  auto cli = MakeClient(endpoint_);
+  auto res = cli->Get(JoinPath(endpoint_.base_path, "/health"));
+  if (!res) {
+    if (err) *err = "failed to connect to server";
+    return false;
+  }
+  if (res->status < 200 || res->status >= 300) {
+    if (err) *err = "health check returned status " + std::to_string(res->status);
+    return false;
+  }
+  return true;
+}
+
+std::vector<ModelInfo> AgentServerProvider::ListModels(std::string* err) {
+  auto cli = MakeClient(endpoint_);
+  auto res = cli->Get(JoinPath(endpoint_.base_path, "/v1/models"));
+  
+  if (!res) {
+    if (err) *err = "failed to connect to server for models";
+    return {};
+  }
+  
+  if (res->status < 200 || res->status >= 300) {
+    if (err) *err = "/v1/models returned status " + std::to_string(res->status);
+    return {};
+  }
+  
+  auto j = nlohmann::json::parse(res->body, nullptr, false);
+  if (j.is_discarded() || !j.contains("data") || !j["data"].is_array()) {
+    if (err) *err = "invalid json from /v1/models";
+    return {};
+  }
+  
+  std::vector<ModelInfo> out;
+  for (const auto& item : j["data"]) {
+    if (!item.is_object()) continue;
+    ModelInfo m;
+    if (item.contains("id") && item["id"].is_string()) {
+      m.id = item["id"].get<std::string>();
+    }
+    if (item.contains("owned_by") && item["owned_by"].is_string()) {
+      m.owned_by = item["owned_by"].get<std::string>();
+    }
+    if (m.owned_by.empty()) m.owned_by = "llama-server";
+    if (!m.id.empty()) {
+      out.push_back(std::move(m));
+    }
+  }
+  return out;
+}
+
+std::optional<std::vector<double>> AgentServerProvider::Embeddings(
+    const std::string& model, const std::string& input, std::string* err) {
+  auto cli = MakeClient(endpoint_);
+  nlohmann::json j;
+  j["model"] = model;
+  j["input"] = input;
+  
+  auto res = cli->Post(JoinPath(endpoint_.base_path, "/v1/embeddings"), 
+                       j.dump(), "application/json");
+  
+  if (!res) {
+    if (err) *err = "failed to connect to server for embeddings";
+    return std::nullopt;
+  }
+  
+  if (res->status < 200 || res->status >= 300) {
+    if (err) *err = "/v1/embeddings returned status " + std::to_string(res->status);
+    return std::nullopt;
+  }
+  
+  auto jr = nlohmann::json::parse(res->body, nullptr, false);
+  if (jr.is_discarded() || !jr.contains("data") || !jr["data"].is_array() || 
+      jr["data"].empty() || !jr["data"][0].is_object() ||
+      !jr["data"][0].contains("embedding") || !jr["data"][0]["embedding"].is_array()) {
+    if (err) *err = "invalid json from /v1/embeddings";
+    return std::nullopt;
+  }
+  
+  std::vector<double> vec;
+  for (const auto& v : jr["data"][0]["embedding"]) {
+    if (v.is_number_float() || v.is_number_integer()) {
+      vec.push_back(v.get<double>());
+    }
+  }
+  return vec;
+}
+
 std::optional<ChatResponse> AgentServerProvider::ChatOnce(const ChatRequest& req, std::string* err) {
-  std::string full_content;
-  std::string finish_reason = "stop";
+  auto cli = MakeClient(endpoint_);
   
-  const bool ok = ChatStream(
-      req,
-      [&](const std::string& delta) {
-        full_content += delta;
-        return true;
-      },
-      [&](const std::string& fr) {
-        finish_reason = fr;
-      },
-      err);
+  nlohmann::json j;
+  j["model"] = req.model;
+  j["stream"] = false;
   
-  if (!ok) return std::nullopt;
+  if (req.max_tokens.has_value() && req.max_tokens.value() > 0) {
+    j["max_tokens"] = req.max_tokens.value();
+  }
+  if (req.temperature.has_value()) {
+    j["temperature"] = req.temperature.value();
+  }
+  if (req.top_p.has_value()) {
+    j["top_p"] = req.top_p.value();
+  }
   
-  ChatResponse resp;
-  resp.model = req.model;
-  resp.content = std::move(full_content);
-  resp.done = true;
-  resp.finish_reason = std::move(finish_reason);
-  return resp;
+  j["messages"] = nlohmann::json::array();
+  for (const auto& m : req.messages) {
+    j["messages"].push_back({{"role", m.role}, {"content", m.content}});
+  }
+  
+  auto res = cli->Post(JoinPath(endpoint_.base_path, "/v1/chat/completions"), 
+                       j.dump(), "application/json");
+  
+  if (!res) {
+    if (err) *err = "failed to connect to server for chat";
+    return std::nullopt;
+  }
+  
+  if (res->status < 200 || res->status >= 300) {
+    if (err) *err = "/v1/chat/completions returned status " + std::to_string(res->status);
+    return std::nullopt;
+  }
+  
+  auto jr = nlohmann::json::parse(res->body, nullptr, false);
+  if (jr.is_discarded() || !jr.contains("choices") || !jr["choices"].is_array() || 
+      jr["choices"].empty() || !jr["choices"][0].is_object() ||
+      !jr["choices"][0].contains("message") || !jr["choices"][0]["message"].is_object() ||
+      !jr["choices"][0]["message"].contains("content")) {
+    if (err) *err = "invalid json from /v1/chat/completions";
+    return std::nullopt;
+  }
+  
+  ChatResponse out;
+  out.model = req.model;
+  if (jr["choices"][0]["message"]["content"].is_string()) {
+    out.content = jr["choices"][0]["message"]["content"].get<std::string>();
+  }
+  if (jr["choices"][0].contains("finish_reason") && 
+      jr["choices"][0]["finish_reason"].is_string()) {
+    out.finish_reason = jr["choices"][0]["finish_reason"].get<std::string>();
+  }
+  out.done = true;
+  return out;
 }
 
 bool AgentServerProvider::ChatStream(const ChatRequest& req,
                                       const std::function<bool(const std::string&)>& on_delta,
                                       const std::function<void(const std::string& finish_reason)>& on_done,
                                       std::string* err) {
-  // Get or create agent session
-  std::string agent_session_id;
-  {
-    std::lock_guard<std::mutex> lock(mu_);
-    
-    // Map local session_id to agent session
-    if (req.session_id.has_value() && !req.session_id->empty()) {
-      auto it = session_map_.find(*req.session_id);
-      if (it != session_map_.end()) {
-        agent_session_id = it->second;
-      } else {
-        // Create new agent session for this local session
-        std::string create_err;
-        auto new_session = CreateSession(&create_err);
-        if (!new_session) {
-          if (err) *err = "failed to create agent session: " + create_err;
-          return false;
-        }
-        agent_session_id = *new_session;
-        session_map_[*req.session_id] = agent_session_id;
-      }
-    } else {
-      // Use default session
-      if (default_agent_session_.empty()) {
-        std::string create_err;
-        auto new_session = CreateSession(&create_err);
-        if (!new_session) {
-          if (err) *err = "failed to create default agent session: " + create_err;
-          return false;
-        }
-        default_agent_session_ = *new_session;
-      }
-      agent_session_id = default_agent_session_;
-    }
-  }
-  
-  // Build the message content from the request
-  // For agent server, we send the last user message
-  std::string content;
-  if (!req.messages.empty()) {
-    // Find the last user message
-    for (auto it = req.messages.rbegin(); it != req.messages.rend(); ++it) {
-      if (it->role == "user") {
-        content = it->content;
-        break;
-      }
-    }
-    // If no user message, use the last message
-    if (content.empty()) {
-      content = req.messages.back().content;
-    }
-  }
-  
-  if (content.empty()) {
-    if (err) *err = "no message content provided";
-    return false;
-  }
-  
   auto cli = MakeClient(endpoint_);
   
-  // Build request body
-  nlohmann::json body;
-  body["content"] = content;
+  // Build request body with streaming enabled
+  nlohmann::json j;
+  j["model"] = req.model;
+  j["stream"] = true;  // Enable streaming
   
-  std::string path = JoinPath(endpoint_.base_path, "/v1/agent/session/" + agent_session_id + "/chat");
+  if (req.max_tokens.has_value() && req.max_tokens.value() > 0) {
+    j["max_tokens"] = req.max_tokens.value();
+  }
+  if (req.temperature.has_value()) {
+    j["temperature"] = req.temperature.value();
+  }
+  if (req.top_p.has_value()) {
+    j["top_p"] = req.top_p.value();
+  }
   
-  // Build request
+  j["messages"] = nlohmann::json::array();
+  for (const auto& m : req.messages) {
+    j["messages"].push_back({{"role", m.role}, {"content", m.content}});
+  }
+  
+  std::string path = JoinPath(endpoint_.base_path, "/v1/chat/completions");
+  
+  // Build request for streaming
   httplib::Request http_req;
   http_req.method = "POST";
   http_req.path = path;
   http_req.set_header("Content-Type", "application/json");
-  http_req.body = body.dump();
+  http_req.body = j.dump();
   
   std::string buffer;
   std::string finish_reason = "stop";
@@ -370,31 +346,40 @@ bool AgentServerProvider::ChatStream(const ChatRequest& req,
     auto events = ParseSseEvents(buffer);
     
     for (const auto& event : events) {
-      if (event.event_type == "text_delta") {
-        // Parse the JSON data
-        auto j = nlohmann::json::parse(event.data, nullptr, false);
-        if (!j.is_discarded() && j.contains("delta") && j["delta"].is_string()) {
-          if (!on_delta(j["delta"].get<std::string>())) {
-            client_cancelled = true;
-            return false;  // Client cancelled
+      // OpenAI streaming format: data: {...}
+      if (event.data == "[DONE]") {
+        // Stream finished
+        continue;
+      }
+      
+      auto ej = nlohmann::json::parse(event.data, nullptr, false);
+      if (ej.is_discarded()) continue;
+      
+      // Parse delta content
+      if (ej.contains("choices") && ej["choices"].is_array() && !ej["choices"].empty()) {
+        const auto& choice = ej["choices"][0];
+        if (choice.is_object()) {
+          // Get delta content
+          if (choice.contains("delta") && choice["delta"].is_object()) {
+            const auto& delta = choice["delta"];
+            if (delta.contains("content") && delta["content"].is_string()) {
+              std::string content = delta["content"].get<std::string>();
+              if (!content.empty()) {
+                if (!on_delta(content)) {
+                  client_cancelled = true;
+                  return false;
+                }
+              }
+            }
+          }
+          // Get finish reason
+          if (choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
+            if (choice["finish_reason"].is_string()) {
+              finish_reason = choice["finish_reason"].get<std::string>();
+            }
           }
         }
-      } else if (event.event_type == "completed") {
-        auto j = nlohmann::json::parse(event.data, nullptr, false);
-        if (!j.is_discarded() && j.contains("finish_reason") && j["finish_reason"].is_string()) {
-          finish_reason = j["finish_reason"].get<std::string>();
-        }
-      } else if (event.event_type == "error") {
-        auto j = nlohmann::json::parse(event.data, nullptr, false);
-        if (!j.is_discarded() && j.contains("message") && j["message"].is_string()) {
-          error_msg = j["message"].get<std::string>();
-        } else {
-          error_msg = event.data;
-        }
-        has_error = true;
-        return false;
       }
-      // Other event types: reasoning_delta, tool_start, tool_result, etc.
     }
     
     // Clear processed events from buffer
@@ -409,7 +394,7 @@ bool AgentServerProvider::ChatStream(const ChatRequest& req,
   auto res = cli->send(http_req);
   
   if (!res) {
-    if (err) *err = "failed to connect to agent server";
+    if (err) *err = "failed to connect to server for streaming chat";
     return false;
   }
   
@@ -419,7 +404,7 @@ bool AgentServerProvider::ChatStream(const ChatRequest& req,
   }
   
   if (res->status < 200 || res->status >= 300) {
-    if (err) *err = "chat request returned status " + std::to_string(res->status);
+    if (err) *err = "streaming chat returned status " + std::to_string(res->status);
     return false;
   }
   
