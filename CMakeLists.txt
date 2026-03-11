@@ -156,6 +156,7 @@ add_executable(local-ai-runtime
   src/ollama_provider.cpp
   src/openai_router.cpp
   src/session_manager.cpp
+  src/agent_server_provider.cpp
 )
 
 if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)

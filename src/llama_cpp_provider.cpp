@@ -361,6 +361,14 @@ LlamaCppProvider::LlamaCppProvider(std::string model_path) : model_root_(std::mo
       max_sessions_ = static_cast<size_t>(std::min<int32_t>(n, 256));
     }
   }
+  // Read use_jinja setting from environment
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_USE_JINJA");
+    bool b = false;
+    if (!v.empty() && TryParseBool(v, &b)) {
+      use_jinja_ = b;
+    }
+  }
   default_session_ = std::make_shared<SessionState>();
   BuildModelIndex();
 }
@@ -412,6 +420,7 @@ void LlamaCppProvider::Stop() {
     model = model_;
     model_ = nullptr;
     loaded_model_path_.clear();
+    chat_templates_.reset();
   }
   for (auto& s : to_free) {
     if (!s) continue;
@@ -685,6 +694,15 @@ bool LlamaCppProvider::EnsureLoaded(const std::string& model_path, std::string* 
     return false;
   }
   loaded_model_path_ = model_path;
+
+  // Initialize chat templates for jinja support
+  try {
+    chat_templates_ = common_chat_templates_init(model_, "");
+  } catch (const std::exception& e) {
+    std::cerr << "[llama_cpp] chat template init error: " << e.what() << "\n";
+    chat_templates_.reset();
+  }
+
   return true;
 }
 
@@ -847,18 +865,16 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   if (!EnsureContext(session.get(), err)) return false;
   llama_context* ctx = session->ctx;
 
-  // Load config to check use_jinja setting
+  // Load config for generation parameters
   const auto gen_cfg = LoadLlamaRuntimeConfigFromEnv();
-  const bool use_jinja = gen_cfg.use_jinja.has_value() ? gen_cfg.use_jinja.value() : true;
 
   std::string prompt;
   bool used_chat_template = false;
 
-  // Try to use common_chat_templates_apply for jinja support
-  auto chat_templates = common_chat_templates_init(model_, "");
-  if (chat_templates) {
+  // Try to use cached chat_templates_ for jinja support
+  if (chat_templates_) {
     common_chat_templates_inputs inputs;
-    inputs.use_jinja = use_jinja;
+    inputs.use_jinja = use_jinja_;
     inputs.add_generation_prompt = true;
 
     for (const auto& m : req.messages) {
@@ -869,7 +885,7 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
     }
 
     try {
-      common_chat_params params = common_chat_templates_apply(chat_templates.get(), inputs);
+      common_chat_params params = common_chat_templates_apply(chat_templates_.get(), inputs);
       if (!params.prompt.empty()) {
         prompt = std::move(params.prompt);
         used_chat_template = true;

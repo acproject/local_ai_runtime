@@ -170,6 +170,16 @@ RuntimeConfig LoadConfigFromEnv() {
 
   if (auto root = GetEnvStr("RUNTIME_WORKSPACE_ROOT"); !root.empty()) cfg.workspace_root = root;
 
+  // Agent server configuration
+  auto agent_server = GetEnvStr("AGENT_SERVER_HOST");
+  if (!agent_server.empty()) {
+    cfg.agent_server = ParseHttpEndpoint(agent_server, 8081);
+    cfg.agent_server_enabled = true;
+  } else if (ToLower(cfg.default_provider) == "agent_server") {
+    cfg.agent_server = ParseHttpEndpoint("http://127.0.0.1:8081", 8081);
+    cfg.agent_server_enabled = true;
+  }
+
   return cfg;
 }
 

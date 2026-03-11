@@ -4,6 +4,7 @@
 #endif
 #include "openai_compatible_http_provider.hpp"
 #include "ollama_provider.hpp"
+#include "agent_server_provider.hpp"
 #include "openai_router.hpp"
 #include "providers/registry.hpp"
 #include "session_manager.hpp"
@@ -45,6 +46,7 @@ int main() {
   if (cfg.mnn_enabled) providers.Register(std::make_unique<runtime::OpenAiCompatibleHttpProvider>("mnn", cfg.mnn));
   if (cfg.lmdeploy_enabled) providers.Register(std::make_unique<runtime::OpenAiCompatibleHttpProvider>("lmdeploy", cfg.lmdeploy));
   if (cfg.vllm_enabled) providers.Register(std::make_unique<runtime::OpenAiCompatibleHttpProvider>("vllm", cfg.vllm));
+  if (cfg.agent_server_enabled) providers.Register(std::make_unique<runtime::AgentServerProvider>(cfg.agent_server));
   runtime::OpenAiRouter router(&sessions, &providers);
 
   std::cout << "[runtime] default_provider=" << cfg.default_provider << "\n";
@@ -58,6 +60,9 @@ int main() {
             << cfg.lmdeploy.scheme << "://" << cfg.lmdeploy.host << ":" << cfg.lmdeploy.port << cfg.lmdeploy.base_path << "\n";
   std::cout << "[provider] vllm enabled=" << (cfg.vllm_enabled ? "true" : "false") << " endpoint=" << cfg.vllm.scheme << "://"
             << cfg.vllm.host << ":" << cfg.vllm.port << cfg.vllm.base_path << "\n";
+  std::cout << "[provider] agent_server enabled=" << (cfg.agent_server_enabled ? "true" : "false") << " endpoint="
+            << cfg.agent_server.scheme << "://" << cfg.agent_server.host << ":"
+            << cfg.agent_server.port << cfg.agent_server.base_path << "\n";
 
   httplib::Server server;
   router.Register(&server);

@@ -41,6 +41,10 @@ struct RuntimeConfig {
   bool mcp_enabled = false;
   std::vector<HttpEndpoint> mcp_hosts;
   std::string workspace_root;
+  
+  // Agent server configuration (llama-agent-server)
+  HttpEndpoint agent_server;
+  bool agent_server_enabled = false;
 };
 
 RuntimeConfig LoadConfigFromEnv();

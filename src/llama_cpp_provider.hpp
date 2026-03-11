@@ -2,6 +2,8 @@
 
 #include "providers/provider.hpp"
 
+#include <chat.h>
+
 #include <list>
 #include <memory>
 #include <mutex>
@@ -66,6 +68,10 @@ class LlamaCppProvider : public IProvider {
   std::shared_ptr<SessionState> default_session_;
   std::list<std::string> lru_;
   std::unordered_map<std::string, SessionEntry> sessions_;
+
+  // Chat template support (cached for performance)
+  common_chat_templates_ptr chat_templates_;
+  bool use_jinja_ = true;  // default to jinja parser
 };
 
 }  // namespace runtime
