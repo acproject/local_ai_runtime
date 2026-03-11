@@ -182,6 +182,20 @@ std::optional<std::string> AgentServerProvider::CreateSession(std::string* err) 
     body["enable_skills"] = (ToLower(enable_skills) == "true" || enable_skills == "1");
   }
   
+  // Subagent configuration
+  std::string max_subagent_depth = GetEnvStr("AGENT_MAX_SUBAGENT_DEPTH");
+  if (!max_subagent_depth.empty()) {
+    try {
+      int depth = std::stoi(max_subagent_depth);
+      // Clamp to valid range: 0-5
+      if (depth < 0) depth = 0;
+      if (depth > 5) depth = 5;
+      body["max_subagent_depth"] = depth;
+    } catch (...) {
+      // Invalid number, ignore
+    }
+  }
+  
   auto res = cli->Post(JoinPath(endpoint_.base_path, "/v1/agent/session"), 
                        body.dump(), "application/json");
   if (!res) {
