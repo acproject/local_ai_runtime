@@ -115,7 +115,7 @@ export NO_PROXY='127.0.0.1,localhost'
 export no_proxy='127.0.0.1,localhost'
 export LLAMA_CPP_N_CTX='8192'
 export LLAMA_CPP_MAX_NEW_TOKENS='512'
-export LLAMA_CPP_FLASH_ATTN='disabled'
+export LLAMA_CPP_FLASH_ATTN='enabled'
 export LLAMA_CPP_N_BATCH='256'
 export LLAMA_CPP_N_UBATCH='128'
 export LLAMA_CPP_TEMPERATURE='0.7'
@@ -123,6 +123,7 @@ export LLAMA_CPP_TOP_P='0.9'
 export LLAMA_CPP_SEED='42'
 export LLAMA_CPP_N_GPU_LAYERS='12'
 export LLAMA_CPP_OFFLOAD_KQV='0'
+export LLAMA_CPP_USE_JINJA='true'
 export RUNTIME_SESSION_STORE_TYPE='minimemory'
 export RUNTIME_SESSION_STORE_ENDPOINT='http://127.0.0.1:6379'
 export RUNTIME_SESSION_STORE_PASSWORD=''
@@ -131,6 +132,11 @@ export RUNTIME_SESSION_STORE_RESET_ON_BOOT='true'
 # 若跨重启共享历史，启用稳定命名空间；否则不要设置此变量
 # export RUNTIME_SESSION_STORE_NAMESPACE='stable'
 export MCP_HOST='http://127.0.0.1:9000'
+
+# LLAMA_CPP_USE_JINJA: 是否使用 jinja 解析器处理 chat template
+# - true (默认): 使用 jinja 解析器，支持更多模板格式
+# - false: 使用旧的 legacy 模板解析器
+export LLAMA_CPP_USE_JINJA='true'
 
 ./build/bin/Release/local-ai-runtime
 ```

@@ -1,6 +1,7 @@
 #include "llama_cpp_provider.hpp"
 
 #include <llama.h>
+#include <chat.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -172,6 +173,7 @@ struct LlamaRuntimeConfig {
   std::optional<int32_t> seed;
   std::optional<int32_t> penalty_last_n;
   std::optional<float> penalty_repeat;
+  std::optional<bool> use_jinja;
   bool requested = false;
 };
 
@@ -292,6 +294,12 @@ static LlamaRuntimeConfig LoadLlamaRuntimeConfigFromEnv() {
     const std::string v = GetEnvStr("LLAMA_CPP_REPEAT_PENALTY");
     float f = 0.0f;
     if (!v.empty() && TryParseFloat(TrimWs(v), &f) && f > 0.0f) cfg.penalty_repeat = f;
+  }
+
+  {
+    const std::string v = GetEnvStr("LLAMA_CPP_USE_JINJA");
+    bool b = false;
+    if (!v.empty() && TryParseBool(v, &b)) cfg.use_jinja = b;
   }
 
   cfg.requested = (cfg.n_gpu_layers != 0) || (cfg.offload_kqv.has_value() && cfg.offload_kqv.value());
@@ -839,35 +847,70 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   if (!EnsureContext(session.get(), err)) return false;
   llama_context* ctx = session->ctx;
 
+  // Load config to check use_jinja setting
+  const auto gen_cfg = LoadLlamaRuntimeConfigFromEnv();
+  const bool use_jinja = gen_cfg.use_jinja.has_value() ? gen_cfg.use_jinja.value() : true;
+
   std::string prompt;
   bool used_chat_template = false;
-  const char* tmpl = llama_model_chat_template(model_, nullptr);
-  if (tmpl && tmpl[0] != '\0') {
-    std::vector<llama_chat_message> chat;
-    chat.reserve(req.messages.size());
-    size_t approx_len = 0;
+
+  // Try to use common_chat_templates_apply for jinja support
+  auto chat_templates = common_chat_templates_init(model_, "");
+  if (chat_templates) {
+    common_chat_templates_inputs inputs;
+    inputs.use_jinja = use_jinja;
+    inputs.add_generation_prompt = true;
+
     for (const auto& m : req.messages) {
-      llama_chat_message cm{};
-      cm.role = m.role.c_str();
-      cm.content = m.content.c_str();
-      chat.push_back(cm);
-      approx_len += m.role.size() + m.content.size() + 16;
+      common_chat_msg msg;
+      msg.role = m.role;
+      msg.content = m.content;
+      inputs.messages.push_back(std::move(msg));
     }
-    std::string buf;
-    buf.resize(std::max<size_t>(256, approx_len * 2 + 64));
-    int n = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, buf.data(), static_cast<int>(buf.size()));
-    if (n > static_cast<int>(buf.size())) {
-      buf.resize(static_cast<size_t>(n));
-      n = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, buf.data(), static_cast<int>(buf.size()));
+
+    try {
+      common_chat_params params = common_chat_templates_apply(chat_templates.get(), inputs);
+      if (!params.prompt.empty()) {
+        prompt = std::move(params.prompt);
+        used_chat_template = true;
+      }
+    } catch (const std::exception& e) {
+      // Fallback to legacy template or BuildPrompt
+      std::cerr << "[llama_cpp] chat template error: " << e.what() << ", falling back to legacy\n";
     }
-    if (n > 0) {
-      buf.resize(static_cast<size_t>(n));
-      prompt = std::move(buf);
-      used_chat_template = true;
-    } else {
-      prompt = BuildPrompt(req.messages);
+  }
+
+  // Fallback to legacy llama_chat_apply_template if jinja method failed
+  if (!used_chat_template) {
+    const char* tmpl = llama_model_chat_template(model_, nullptr);
+    if (tmpl && tmpl[0] != '\0') {
+      std::vector<llama_chat_message> chat;
+      chat.reserve(req.messages.size());
+      size_t approx_len = 0;
+      for (const auto& m : req.messages) {
+        llama_chat_message cm{};
+        cm.role = m.role.c_str();
+        cm.content = m.content.c_str();
+        chat.push_back(cm);
+        approx_len += m.role.size() + m.content.size() + 16;
+      }
+      std::string buf;
+      buf.resize(std::max<size_t>(256, approx_len * 2 + 64));
+      int n = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, buf.data(), static_cast<int>(buf.size()));
+      if (n > static_cast<int>(buf.size())) {
+        buf.resize(static_cast<size_t>(n));
+        n = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, buf.data(), static_cast<int>(buf.size()));
+      }
+      if (n > 0) {
+        buf.resize(static_cast<size_t>(n));
+        prompt = std::move(buf);
+        used_chat_template = true;
+      }
     }
-  } else {
+  }
+
+  // Final fallback to simple prompt builder
+  if (prompt.empty()) {
     prompt = BuildPrompt(req.messages);
   }
 
@@ -892,7 +935,6 @@ bool LlamaCppProvider::ChatStream(const ChatRequest& req,
   }
   prompt_tokens.resize(static_cast<size_t>(n_tok));
 
-  const auto gen_cfg = LoadLlamaRuntimeConfigFromEnv();
   int max_new_tokens_requested = gen_cfg.max_new_tokens.has_value() ? gen_cfg.max_new_tokens.value() : 2048;
   if (req.max_tokens.has_value() && req.max_tokens.value() > 0) {
     max_new_tokens_requested = req.max_tokens.value();

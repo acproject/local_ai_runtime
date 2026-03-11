@@ -176,12 +176,15 @@ target_link_libraries(local-ai-runtime PRIVATE local-ai-cpp-httplib nlohmann-jso
 
 if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
   target_compile_definitions(local-ai-runtime PRIVATE LOCAL_AI_RUNTIME_WITH_LLAMA_CPP=1)
+  target_include_directories(local-ai-runtime PRIVATE
+    "${LOCAL_AI_RUNTIME_LLAMA_CPP_FOUND_SOURCE_DIR}/common"
+  )
 else()
   target_compile_definitions(local-ai-runtime PRIVATE LOCAL_AI_RUNTIME_WITH_LLAMA_CPP=0)
 endif()
 
 if(LOCAL_AI_RUNTIME_WITH_LLAMA_CPP)
-  target_link_libraries(local-ai-runtime PRIVATE llama)
+  target_link_libraries(local-ai-runtime PRIVATE llama common)
 endif()
 
 if(MSVC)
